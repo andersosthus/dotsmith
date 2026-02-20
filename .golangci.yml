@@ -1,0 +1,39 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - staticcheck
+    - govet
+    - ineffassign
+    - unused
+    - gocyclo
+    - funlen
+    - wrapcheck
+    - exhaustive
+    - noctx
+    - bodyclose
+    - revive
+
+  settings:
+    gocyclo:
+      min-complexity: 9
+
+    funlen:
+      lines: 100
+      statements: 60
+
+    exhaustive:
+      default-signifies-exhaustive: true
+
+    revive:
+      rules:
+        - name: unexported-return
+
+    wrapcheck:
+      ignoreSigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Unwrap(
+        - .Wrap(
+        - .Wrapf(

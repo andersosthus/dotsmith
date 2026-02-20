@@ -1,0 +1,74 @@
+version: 2
+
+project_name: dotsmith
+
+before:
+  hooks:
+    - go mod tidy
+    - ./scripts/licenses.sh
+    - ./scripts/completions.sh
+
+builds:
+  - id: dotsmith
+    main: ./cmd/dotsmith
+    binary: dotsmith
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/andersosthus/dotsmith/internal/cli.Version={{.Version}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: dotsmith
+    build_ids:
+      - dotsmith
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - THIRD_PARTY_LICENSES
+      - completions/*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+aurs:
+  - name: dotsmith-bin
+    homepage: "https://github.com/andersosthus/dotsmith"
+    description: "Dotfile manager combining GNU Stow-style symlink management with Kustomize-inspired overlays"
+    maintainers:
+      - "dotsmith contributors <https://github.com/andersosthus/dotsmith>"
+    license: MIT
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/dotsmith-bin.git"
+    provides:
+      - dotsmith
+    conflicts:
+      - dotsmith
+    package: |-
+      install -Dm755 dotsmith "${pkgdir}/usr/bin/dotsmith"
+      install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+      install -Dm644 THIRD_PARTY_LICENSES "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_LICENSES"
+      install -Dm644 completions/dotsmith.bash \
+          "${pkgdir}/usr/share/bash-completion/completions/dotsmith"
+      install -Dm644 completions/dotsmith.zsh \
+          "${pkgdir}/usr/share/zsh/site-functions/_dotsmith"
+      install -Dm644 completions/dotsmith.fish \
+          "${pkgdir}/usr/share/fish/vendor_completions.d/dotsmith.fish"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
