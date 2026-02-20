@@ -1,0 +1,7 @@
+bin/
+completions/
+dist/
+*.exe
+coverage.out
+coverage.html
+THIRD_PARTY_LICENSES
