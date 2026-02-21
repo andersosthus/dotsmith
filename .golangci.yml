@@ -31,7 +31,7 @@ linters:
         - name: unexported-return
 
     wrapcheck:
-      ignoreSigs:
+      ignore-sigs:
         - .Errorf(
         - errors.New(
         - errors.Unwrap(
