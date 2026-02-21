@@ -13,7 +13,8 @@ const defaultDotsmithYML = `# dotsmith configuration
 # dotfiles_dir: ~/dotfiles  # defaults to current directory
 # compile_dir: ~/.dotsmith/compiled
 # target_dir: ~
-# age_identity: ~/.age/key.txt
+# age:
+#   identity_file: ~/.dotsmith-age-key
 `
 
 // Injectable for testing.

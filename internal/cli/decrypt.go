@@ -24,9 +24,6 @@ func newDecryptCmd() *cobra.Command {
 			if !strings.HasSuffix(path, ".age") {
 				return fmt.Errorf("decrypt: %s does not have .age extension", path)
 			}
-			if cfg.AgeIdentity == "" {
-				return fmt.Errorf("decrypt: age_identity not configured (set age_identity in .dotsmith.yml)")
-			}
 
 			ks := encrypt.KeySource{IdentityFile: cfg.AgeIdentity}
 			content, err := decryptFileFunc(cmd.Context(), path, ks)

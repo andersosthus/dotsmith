@@ -24,9 +24,6 @@ func newEncryptCmd() *cobra.Command {
 			if strings.HasSuffix(path, ".age") {
 				return fmt.Errorf("encrypt: %s already has .age extension", path)
 			}
-			if cfg.AgeIdentity == "" {
-				return fmt.Errorf("encrypt: age_identity not configured (set age_identity in .dotsmith.yml)")
-			}
 
 			ks := encrypt.KeySource{IdentityFile: cfg.AgeIdentity}
 			if err := encryptFileInPlaceFunc(cmd.Context(), path, ks); err != nil {
