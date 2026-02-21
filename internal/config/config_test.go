@@ -32,6 +32,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if c.Identity.OS == "" {
 		t.Error("Identity.OS should be auto-detected")
 	}
+	if c.AgeIdentity != filepath.Join(home, ".dotsmith-age-key") {
+		t.Errorf("AgeIdentity = %q, want ~/.dotsmith-age-key", c.AgeIdentity)
+	}
 }
 
 func TestLoad_ConfigFileOverridesDefaults(t *testing.T) {
