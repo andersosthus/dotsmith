@@ -107,32 +107,34 @@ A dotsmith repository looks like this:
 ├── .dotsmith.yml          # repo-level config (optional)
 │
 ├── base/                  # applied to every machine
-│   ├── .bashrc            # regular file — copied as-is
-│   ├── .bashrc.subfile-010.sh          # subfile fragment 010
-│   ├── .bashrc.subfile-020.sh          # subfile fragment 020
+│   ├── .profile           # regular file — copied as-is
+│   ├── .subfile-010.bashrc             # subfile fragment 010
+│   ├── .subfile-020.bashrc             # subfile fragment 020
 │   └── .config/
-│       └── git/
-│           └── config     # regular file in a subdirectory
+│       ├── git/
+│       │   └── config     # regular file in a subdirectory
+│       └── fish/
+│           └── config.subfile-010.fish # subfile fragment 010 for config.fish
 │
 ├── os/
 │   ├── linux/             # applied on Linux machines
-│   │   └── .bashrc.subfile-050.sh
+│   │   └── .subfile-050.bashrc
 │   └── darwin/            # applied on macOS machines
-│       └── .bashrc.subfile-050.sh
+│       └── .subfile-050.bashrc
 │
 ├── hostname/
 │   └── workstation/       # applied on host named "workstation"
-│       ├── .bashrc.subfile-020.sh      # replaces base fragment 020
+│       ├── .subfile-020.bashrc         # replaces base fragment 020
 │       └── .ssh/
 │           └── config.age              # encrypted regular file
 │
 ├── username/
 │   └── alice/             # applied when logged in as alice
-│       └── .bashrc.subfile-090.sh
+│       └── .subfile-090.bashrc
 │
 └── userhost/
     └── alice@workstation/ # applied for alice on workstation only
-        └── .bashrc.subfile-020.sh.ignore  # suppress fragment 020
+        └── .subfile-020.bashrc.ignore  # suppress fragment 020
 ```
 
 After `dotsmith compile`, the compiled output (`~/.dotcompiled/` by default) mirrors the
@@ -141,6 +143,7 @@ into the target directory (`~` by default):
 
 ```
 ~/.bashrc  →  ~/.dotcompiled/.bashrc
+~/.profile  →  ~/.dotcompiled/.profile
 ~/.config/git/config  →  ~/.dotcompiled/.config/git/config
 ```
 
@@ -152,12 +155,15 @@ different override layer.
 **Naming convention:**
 
 ```
-<target>.subfile-<NNN>.<ext>[.age]
+<stem>.subfile-<NNN>[.<ext>][.age]
 ```
 
+The compiled target is `<stem><ext>` — the stem and extension joined without any separator.
+
 Examples:
-- `.bashrc.subfile-010.sh` — fragment 010 for `.bashrc`, shell extension
-- `.bashrc.subfile-020.sh.age` — encrypted fragment 020 for `.bashrc`
+- `.subfile-010.bashrc` — fragment 010, compiles to `.bashrc`
+- `.subfile-020.bashrc.age` — encrypted fragment 020, compiles to `.bashrc`
+- `config.subfile-001.fish` — fragment 001, compiles to `config.fish`
 
 The number `<NNN>` controls assembly order. Fragments are sorted using natural (numeric-aware)
 order, so `subfile-2` sorts before `subfile-10` regardless of zero-padding. Gaps are allowed;
@@ -167,7 +173,7 @@ The `<ext>` suffix determines the comment style for the provenance header insert
 fragment:
 
 ```sh
-# --- dotsmith: .bashrc.subfile-020.sh (hostname/workstation) ---
+# --- dotsmith: .subfile-020.bashrc (hostname/workstation) ---
 ```
 
 Supported comment styles: `#` (sh/py/yml/toml/conf), `//` (js/ts/go/rs/css), `--` (lua/sql),
@@ -192,7 +198,7 @@ base  →  os/<goos>  →  hostname/<host>  →  username/<user>  →  userhost/
 |------------------------|--------|
 | Subfile with a **new** number | Added to the assembled output |
 | Subfile with an **existing** number | Replaces the base layer's fragment with that number |
-| `<target>.subfile-<NNN>.<ext>.ignore` | Suppresses that fragment from the output |
+| `<stem>.subfile-<NNN>.<ext>.ignore` | Suppresses that fragment from the output |
 | `<filename>.ignore` | Suppresses the entire regular file from the output |
 
 **Identity auto-detection:**
