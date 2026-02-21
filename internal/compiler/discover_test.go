@@ -343,6 +343,97 @@ func keys(m map[string]*FileEntry) []string {
 	return result
 }
 
+func TestDiscover_DotfileTargetOmitsSyntaxExt(t *testing.T) {
+	// Dotfiles like .bashrc have no file extension — the .sh in the subfile
+	// name is purely for comment-style detection and must NOT appear in the
+	// compiled target path.
+	root := stubDotfiles(t)
+	base := filepath.Join(root, "base")
+
+	writeFile(t, base, ".bashrc.subfile-010.sh", "# 010\n")
+	writeFile(t, base, ".bashrc.subfile-020.sh", "# 020\n")
+
+	ctx := context.Background()
+	entries, err := Discover(ctx, root, baseOnly)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+
+	if _, ok := entries[".bashrc"]; !ok {
+		t.Fatalf("expected entry for %q, got keys: %v", ".bashrc", keys(entries))
+	}
+	if _, ok := entries[".bashrc.sh"]; ok {
+		t.Error("syntax extension .sh must not be appended to dotfile target")
+	}
+}
+
+func TestDiscover_SubfileWithExtensionTarget(t *testing.T) {
+	// The naming convention is <complete-target>.subfile-NNN.<syntax-ext>.
+	// For a target named config.fish, use config.fish.subfile-NNN.fish.
+	root := stubDotfiles(t)
+	base := filepath.Join(root, "base")
+
+	writeFile(t, base, "config.fish.subfile-001.fish", "# 001\n")
+	writeFile(t, base, "config.fish.subfile-050.fish", "# 050\n")
+
+	ctx := context.Background()
+	entries, err := Discover(ctx, root, baseOnly)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+
+	if _, ok := entries["config.fish"]; !ok {
+		t.Errorf("expected entry for %q, got keys: %v", "config.fish", keys(entries))
+	}
+}
+
+func TestDiscover_NestedSubfileWithExtensionTarget(t *testing.T) {
+	root := stubDotfiles(t)
+	base := makeDir(t, root, "base", ".config", "fish")
+
+	writeFile(t, base, "config.fish.subfile-001.fish", "# 001\n")
+	writeFile(t, base, "config.fish.subfile-050.fish", "# 050\n")
+
+	ctx := context.Background()
+	entries, err := Discover(ctx, root, baseOnly)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+
+	key := filepath.Join(".config", "fish", "config.fish")
+	if _, ok := entries[key]; !ok {
+		t.Errorf("expected entry for %q, got keys: %v", key, keys(entries))
+	}
+}
+
+func TestDiscover_IgnoreSubfileWithExtensionTarget(t *testing.T) {
+	root := stubDotfiles(t)
+	base := filepath.Join(root, "base")
+	hostDir := makeDir(t, root, "hostname", "box")
+
+	writeFile(t, base, "config.fish.subfile-001.fish", "# 001\n")
+	writeFile(t, base, "config.fish.subfile-050.fish", "# 050\n")
+	writeFile(t, hostDir, "config.fish.subfile-050.fish.ignore", "")
+
+	ctx := context.Background()
+	id := identity.Identity{Hostname: "box"}
+	entries, err := Discover(ctx, root, id)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+
+	e := entries["config.fish"]
+	if e == nil {
+		t.Fatalf("expected entry for config.fish")
+	}
+	if len(e.Subfiles) != 1 {
+		t.Fatalf("len(Subfiles) = %d, want 1 (050 should be ignored)", len(e.Subfiles))
+	}
+	if e.Subfiles[0].Number != "001" {
+		t.Errorf("remaining subfile = %q, want %q", e.Subfiles[0].Number, "001")
+	}
+}
+
 func TestApplyIgnoreToSubfile_NonSubfileBase(t *testing.T) {
 	entries := make(map[string]*FileEntry)
 	// targetBase is not a subfile name — ParseSubfileName returns nil, early return.

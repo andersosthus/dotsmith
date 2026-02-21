@@ -96,6 +96,27 @@ func TestCompile_WithCommentHeaders(t *testing.T) {
 	}
 }
 
+func TestCompile_SubfilePreservesTargetExtension(t *testing.T) {
+	// Targets with extensions use the full target name in the subfile filename,
+	// e.g. config.fish.subfile-001.fish compiles to config.fish.
+	root := t.TempDir()
+	makeDir(t, root, "base")
+	writeFile(t, filepath.Join(root, "base"), "config.fish.subfile-001.fish", "# 001\n")
+	writeFile(t, filepath.Join(root, "base"), "config.fish.subfile-050.fish", "# 050\n")
+
+	ctx := context.Background()
+	result, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(result.Files) != 1 {
+		t.Fatalf("len(Files) = %d, want 1", len(result.Files))
+	}
+	if result.Files[0].RelPath != "config.fish" {
+		t.Errorf("RelPath = %q, want %q", result.Files[0].RelPath, "config.fish")
+	}
+}
+
 func TestCompile_NoHeaderForUnknownExtension(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
