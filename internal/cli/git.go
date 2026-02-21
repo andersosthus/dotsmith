@@ -35,11 +35,15 @@ func newGitCmd() *cobra.Command {
 }
 
 func newGitInstallCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Append dotsmith hook to post-merge and post-checkout",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			branch, err := cmd.Flags().GetString("branch")
+			if err != nil {
+				return fmt.Errorf("git install: get --branch flag: %w", err)
+			}
 			hooksDir, err := findHooksDir()
 			if err != nil {
 				return err
@@ -48,13 +52,15 @@ func newGitInstallCmd() *cobra.Command {
 				return fmt.Errorf("git install: create hooks dir: %w", err)
 			}
 			for _, name := range gitHookFiles {
-				if err = installHook(hooksDir, name, cmd); err != nil {
+				if err = installHook(hooksDir, name, branch, cmd); err != nil {
 					return err
 				}
 			}
 			return nil
 		},
 	}
+	cmd.Flags().String("branch", "", "only run dotsmith apply when the current branch matches this name")
+	return cmd
 }
 
 func newGitRemoveCmd() *cobra.Command {
@@ -77,7 +83,7 @@ func newGitRemoveCmd() *cobra.Command {
 	}
 }
 
-func installHook(hooksDir, name string, cmd *cobra.Command) error {
+func installHook(hooksDir, name, branch string, cmd *cobra.Command) error {
 	path := filepath.Join(hooksDir, name)
 	existing, err := osReadFileGitFunc(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -91,7 +97,7 @@ func installHook(hooksDir, name string, cmd *cobra.Command) error {
 	if content == "" {
 		content = "#!/bin/sh\n"
 	}
-	content += hookBlock
+	content += hookBlockForBranch(branch)
 	if err = osWriteFileGitFunc(path, []byte(content), 0o755); err != nil {
 		return fmt.Errorf("git install: write %s: %w", path, err)
 	}
@@ -100,6 +106,19 @@ func installHook(hooksDir, name string, cmd *cobra.Command) error {
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "installed hook: %s\n", path)
 	return nil
+}
+
+// hookBlockForBranch returns the hook block to insert. When branch is empty, the plain
+// unconditional block is returned. When branch is set, the apply command is wrapped in a
+// branch guard that checks git branch --show-current.
+func hookBlockForBranch(branch string) string {
+	if branch == "" {
+		return hookBlock
+	}
+	body := "if [ \"$(git branch --show-current)\" = \"" + branch + "\" ]; then\n" +
+		"  " + hookBody + "\n" +
+		"fi"
+	return hookBegin + "\n" + body + "\n" + hookEnd + "\n"
 }
 
 func removeHook(hooksDir, name string, cmd *cobra.Command) error {

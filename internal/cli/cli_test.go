@@ -852,6 +852,76 @@ func TestGitCmd_NoGitDir(t *testing.T) {
 	}
 }
 
+func TestGitInstallCmd_Branch(t *testing.T) {
+	gitDir := t.TempDir()
+	hooksDir := filepath.Join(gitDir, ".git", "hooks")
+	if err := os.MkdirAll(filepath.Join(gitDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	origCwd, _ := os.Getwd()
+	if err := os.Chdir(gitDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origCwd) })
+
+	out, err := run(t, "git", "install", "--branch", "main")
+	if err != nil {
+		t.Fatalf("git install --branch main: %v", err)
+	}
+	if !strings.Contains(out, "installed hook") {
+		t.Errorf("git install output = %q, want 'installed hook'", out)
+	}
+
+	hookPath := filepath.Join(hooksDir, "post-merge")
+	data, readErr := os.ReadFile(hookPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile: %v", readErr)
+	}
+	content := string(data)
+	if !strings.Contains(content, "git branch --show-current") {
+		t.Errorf("hook content = %q, want 'git branch --show-current'", content)
+	}
+	if !strings.Contains(content, `= "main"`) {
+		t.Errorf("hook content = %q, want branch guard for 'main'", content)
+	}
+	if !strings.Contains(content, "dotsmith apply") {
+		t.Errorf("hook content = %q, want 'dotsmith apply'", content)
+	}
+}
+
+func TestGitInstallCmd_BranchEmpty(t *testing.T) {
+	gitDir := t.TempDir()
+	hooksDir := filepath.Join(gitDir, ".git", "hooks")
+	if err := os.MkdirAll(filepath.Join(gitDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	origCwd, _ := os.Getwd()
+	if err := os.Chdir(gitDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origCwd) })
+
+	_, err := run(t, "git", "install")
+	if err != nil {
+		t.Fatalf("git install: %v", err)
+	}
+
+	hookPath := filepath.Join(hooksDir, "post-merge")
+	data, readErr := os.ReadFile(hookPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile: %v", readErr)
+	}
+	content := string(data)
+	if strings.Contains(content, "git branch --show-current") {
+		t.Errorf("hook content = %q, want no branch guard when --branch is not set", content)
+	}
+	if !strings.Contains(content, "dotsmith apply") {
+		t.Errorf("hook content = %q, want 'dotsmith apply'", content)
+	}
+}
+
 func TestGitInstallCmd_MkdirError(t *testing.T) {
 	gitDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(gitDir, ".git"), 0o755); err != nil {
