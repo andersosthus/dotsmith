@@ -87,7 +87,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("dotfiles_dir", "~/.dotfiles")
 	v.SetDefault("compile_dir", "~/.dotcompiled")
 	v.SetDefault("target_dir", "~")
-	// age.identity_file has no default — user must configure it or pass --age-identity.
+	v.SetDefault("age.identity_file", "~/.dotsmith-age-key")
 }
 
 // loadConfigFiles adds config sources in precedence order (lowest first).

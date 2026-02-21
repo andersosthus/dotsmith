@@ -390,14 +390,14 @@ func TestEncryptCmd_AlreadyAge(t *testing.T) {
 	}
 }
 
-func TestEncryptCmd_NoIdentity(t *testing.T) {
+func TestEncryptCmd_KeyFileMissing(t *testing.T) {
 	plain := filepath.Join(t.TempDir(), "file.txt")
 	if err := os.WriteFile(plain, []byte("data"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	_, err := run(t, "encrypt", plain)
+	_, err := run(t, "--age-identity", "/nonexistent/age.key", "encrypt", plain)
 	if err == nil {
-		t.Fatal("expected error for missing age identity, got nil")
+		t.Fatal("expected error for missing key file, got nil")
 	}
 }
 
@@ -446,10 +446,10 @@ func TestDecryptCmd_NotAge(t *testing.T) {
 	}
 }
 
-func TestDecryptCmd_NoIdentity(t *testing.T) {
-	_, err := run(t, "decrypt", "/some/file.age")
+func TestDecryptCmd_KeyFileMissing(t *testing.T) {
+	_, err := run(t, "--age-identity", "/nonexistent/age.key", "decrypt", "/some/file.age")
 	if err == nil {
-		t.Fatal("expected error for missing age identity, got nil")
+		t.Fatal("expected error for missing key file, got nil")
 	}
 }
 
