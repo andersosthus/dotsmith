@@ -61,11 +61,29 @@ which in turn was assembled from your dotfiles layers.
 
 ### Shell completions
 
-```sh
-dotsmith shell bash >> ~/.bashrc
-dotsmith shell zsh  >> ~/.zshrc
-dotsmith shell fish > ~/.config/fish/completions/dotsmith.fish
-```
+**From a release archive or AUR package:**
+
+Release archives include pre-generated completion files in `completions/`. The AUR package installs
+them automatically. For manual installs from a release archive:
+
+- **Bash**: `cp completions/dotsmith.bash ~/.local/share/bash-completion/completions/dotsmith`
+- **Zsh**: `cp completions/dotsmith.zsh /usr/local/share/zsh/site-functions/_dotsmith`
+  (or any directory on `$fpath`)
+- **Fish**: `cp completions/dotsmith.fish ~/.config/fish/completions/dotsmith.fish`
+
+**Generate at runtime** (installs from source or when completions aren't bundled):
+
+- **Bash**: `dotsmith shell bash > ~/.local/share/bash-completion/completions/dotsmith`
+- **Zsh**: `dotsmith shell zsh > "${fpath[1]}/_dotsmith"`
+  (or a custom directory added to `$fpath` before `compinit`)
+- **Fish**: `dotsmith shell fish > ~/.config/fish/completions/dotsmith.fish`
+
+How each shell loads completions:
+
+- **Bash**: the `bash-completion` package lazy-loads from
+  `~/.local/share/bash-completion/completions/`
+- **Zsh**: loaded via `compinit` from directories listed in `$fpath`
+- **Fish**: auto-loaded by command name from `~/.config/fish/completions/`
 
 ## Commands
 
