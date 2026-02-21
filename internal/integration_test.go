@@ -174,8 +174,8 @@ func generateKey(t *testing.T) string {
 func TestIntegration_FullCycle(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
-	s.writeBase(t, ".bashrc.subfile-010.sh", "export PATH=/usr/bin\n")
-	s.writeBase(t, ".bashrc.subfile-020.sh", "alias ll='ls -la'\n")
+	s.writeBase(t, ".subfile-010.bashrc", "export PATH=/usr/bin\n")
+	s.writeBase(t, ".subfile-020.bashrc", "alias ll='ls -la'\n")
 
 	stats := s.compileAndWrite(t, ctx)
 	if stats.Written != 1 {
@@ -224,10 +224,10 @@ func TestIntegration_OverrideCycle(t *testing.T) {
 	s := newScenario(t)
 	id := mustDetect(t)
 
-	s.writeBase(t, ".vimrc.subfile-010.vim", "set nocompatible\n")
-	s.writeBase(t, ".vimrc.subfile-020.vim", "set number\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set nocompatible\n")
+	s.writeBase(t, ".subfile-020.vimrc", "set number\n")
 	// OS layer: dotfiles/os/<osname>/
-	s.writeLayer(t, filepath.Join("os", id.OS), ".vimrc.subfile-030.vim", "\" OS-specific\n")
+	s.writeLayer(t, filepath.Join("os", id.OS), ".subfile-030.vimrc", "\" OS-specific\n")
 
 	result, err := compiler.Compile(ctx, compiler.CompileConfig{
 		DotfilesDir: s.dotfiles,
@@ -253,10 +253,10 @@ func TestIntegration_IgnoreMarker(t *testing.T) {
 	s := newScenario(t)
 	id := mustDetect(t)
 
-	s.writeBase(t, ".bashrc.subfile-010.sh", "export A=1\n")
-	s.writeBase(t, ".bashrc.subfile-020.sh", "export B=2\n")
-	// OS layer ignores subfile-010: marker must include the subfile extension.
-	s.writeLayer(t, filepath.Join("os", id.OS), ".bashrc.subfile-010.sh.ignore", "")
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-020.bashrc", "export B=2\n")
+	// OS layer ignores subfile-010.
+	s.writeLayer(t, filepath.Join("os", id.OS), ".subfile-010.bashrc.ignore", "")
 
 	result, err := compiler.Compile(ctx, compiler.CompileConfig{
 		DotfilesDir: s.dotfiles,
@@ -283,7 +283,7 @@ func TestIntegration_EncryptionCycle(t *testing.T) {
 	keyPath := generateKey(t)
 	s := newScenario(t)
 
-	plainFile := filepath.Join(s.dotfiles, "base", "secrets.sh.subfile-010.sh")
+	plainFile := filepath.Join(s.dotfiles, "base", "secrets.subfile-010.sh")
 	if err := os.WriteFile(plainFile, []byte("export SECRET=hunter2\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestIntegration_EncryptionCycle(t *testing.T) {
 func TestIntegration_Idempotency(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
-	s.writeBase(t, ".bashrc.subfile-010.sh", "export A=1\n")
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
 	id := mustDetect(t)
 
 	compileCfg := compiler.CompileConfig{DotfilesDir: s.dotfiles, Identity: id}
@@ -341,7 +341,7 @@ func TestIntegration_Idempotency(t *testing.T) {
 func TestIntegration_DryRun(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
-	s.writeBase(t, ".bashrc.subfile-010.sh", "export A=1\n")
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
 
 	result, _ := compiler.Compile(ctx, compiler.CompileConfig{
 		DotfilesDir: s.dotfiles,
@@ -383,7 +383,7 @@ func TestIntegration_DryRun(t *testing.T) {
 func TestIntegration_FilePermissions(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
-	s.writeBase(t, ".bashrc.subfile-010.sh", "export A=1\n")
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
 
 	s.compileAndWrite(t, ctx)
 
@@ -409,7 +409,7 @@ func TestIntegration_FilePermissions(t *testing.T) {
 func TestIntegration_ConflictError(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
-	s.writeBase(t, ".vimrc.subfile-010.vim", "set nocompatible\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set nocompatible\n")
 	s.compileAndWrite(t, ctx)
 
 	if err := os.WriteFile(filepath.Join(s.targetDir, ".vimrc"), []byte("existing"), 0o644); err != nil {
@@ -427,7 +427,7 @@ func TestIntegration_ConflictError(t *testing.T) {
 func TestIntegration_StalenessDetection(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
-	s.writeBase(t, ".bashrc.subfile-010.sh", "export A=1\n")
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
 
 	s.compileAndWrite(t, ctx)
 	refs, _ := compiledRefs(s.compileDir)
@@ -461,12 +461,12 @@ func TestIntegration_DirectoryCleanup(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
 
-	// Use a subfile with a known extension (.ini) so ParseSubfileName matches.
 	nestedBase := filepath.Join(s.dotfiles, "base", ".config", "git")
 	if err := os.MkdirAll(nestedBase, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(nestedBase, "config.subfile-010.ini"),
+	// config.subfile-010 → stem="config", ext="", target="config"
+	if err := os.WriteFile(filepath.Join(nestedBase, "config.subfile-010"),
 		[]byte("[user]\n  name = Test\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -495,8 +495,8 @@ func TestIntegration_DirectoryCleanup(t *testing.T) {
 func TestIntegration_CommentHeaders(t *testing.T) {
 	ctx := context.Background()
 	s := newScenario(t)
-	s.writeBase(t, "aliases.sh.subfile-010.sh", "alias ll='ls -la'\n")
-	s.writeBase(t, "aliases.sh.subfile-020.sh", "alias la='ls -a'\n")
+	s.writeBase(t, "aliases.subfile-010.sh", "alias ll='ls -la'\n")
+	s.writeBase(t, "aliases.subfile-020.sh", "alias la='ls -a'\n")
 
 	result, err := compiler.Compile(ctx, compiler.CompileConfig{
 		DotfilesDir: s.dotfiles,
