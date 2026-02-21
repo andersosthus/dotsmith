@@ -109,9 +109,13 @@ func applyFile(_ context.Context, entries map[string]*FileEntry, absPath, rel, l
 		// Check if this .ignore targets a subfile or a regular file.
 		info := ParseSubfileName(targetBase)
 		if info != nil {
-			applyIgnoreToSubfile(entries, info.Target, targetBase, targetRel, layerLabel)
+			applyIgnoreToSubfile(entries, info.Target+info.Ext, targetBase, targetRel, layerLabel)
 		} else {
-			applyIgnoreToRegular(entries, targetRel, layerLabel)
+			ignoreTarget := targetRel
+			if strings.HasSuffix(targetBase, ".age") {
+				ignoreTarget = strings.TrimSuffix(targetRel, ".age")
+			}
+			applyIgnoreToRegular(entries, ignoreTarget, layerLabel)
 		}
 		return nil
 	}
@@ -119,22 +123,27 @@ func applyFile(_ context.Context, entries map[string]*FileEntry, absPath, rel, l
 	// Check if this is a subfile.
 	info := ParseSubfileName(base)
 	if info != nil {
-		target := filepath.Join(dir, info.Target)
+		target := filepath.Join(dir, info.Target+info.Ext)
 		if dir == "." {
-			target = info.Target
+			target = info.Target + info.Ext
 		}
 		return applySubfile(entries, absPath, rel, target, info, layerLabel)
 	}
 
 	// Regular file: replaces any existing entry for this relative path.
+	// Strip .age from the target path so the compiled output has the plain name.
 	target := rel
+	encrypted := strings.HasSuffix(base, ".age")
+	if encrypted {
+		target = strings.TrimSuffix(rel, ".age")
+	}
 	e := &FileEntry{
 		Target:    target,
 		IsRegular: true,
 		Subfiles: []SubfileDesc{{
 			Number:     "",
 			SourcePath: absPath,
-			Encrypted:  strings.HasSuffix(base, ".age"),
+			Encrypted:  encrypted,
 			Layer:      layerLabel,
 			SourceName: base,
 		}},

@@ -7,49 +7,64 @@ import (
 
 func TestParseSubfileName(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		wantNil   bool
-		wantTarget string
-		wantNum   string
-		wantExt   string
+		name          string
+		input         string
+		wantNil       bool
+		wantTarget    string
+		wantNum       string
+		wantExt       string
 		wantEncrypted bool
 	}{
 		{
-			name:      "simple sh subfile",
-			input:     ".bashrc.subfile-010.sh",
-			wantTarget: ".bashrc",
-			wantNum:   "010",
-			wantExt:   ".sh",
+			name:       "dotfile-style subfile",
+			input:      ".subfile-010.bashrc",
+			wantTarget: "",
+			wantNum:    "010",
+			wantExt:    ".bashrc",
 		},
 		{
-			name:      "encrypted subfile",
-			input:     ".bashrc.subfile-030.sh.age",
-			wantTarget: ".bashrc",
-			wantNum:   "030",
-			wantExt:   ".sh",
+			name:          "encrypted dotfile-style subfile",
+			input:         ".subfile-030.bashrc.age",
+			wantTarget:    "",
+			wantNum:       "030",
+			wantExt:       ".bashrc",
 			wantEncrypted: true,
 		},
 		{
-			name:      "zero-padded single digit",
-			input:     ".vimrc.subfile-001.vim",
-			wantTarget: ".vimrc",
-			wantNum:   "001",
-			wantExt:   ".vim",
+			name:       "dotfile-style vimrc subfile",
+			input:      ".subfile-001.vimrc",
+			wantTarget: "",
+			wantNum:    "001",
+			wantExt:    ".vimrc",
 		},
 		{
-			name:      "large number",
-			input:     "config.subfile-100.toml",
+			name:       "large number",
+			input:      "config.subfile-100.toml",
 			wantTarget: "config",
-			wantNum:   "100",
-			wantExt:   ".toml",
+			wantNum:    "100",
+			wantExt:    ".toml",
 		},
 		{
-			name:      "nested path subfile",
-			input:     "config.subfile-02.yaml",
+			name:       "nested path subfile",
+			input:      "config.subfile-02.yaml",
 			wantTarget: "config",
-			wantNum:   "02",
-			wantExt:   ".yaml",
+			wantNum:    "02",
+			wantExt:    ".yaml",
+		},
+		{
+			name:       "stem only no ext",
+			input:      ".bashrc.subfile-010",
+			wantTarget: ".bashrc",
+			wantNum:    "010",
+			wantExt:    "",
+		},
+		{
+			name:          "encrypted stem only",
+			input:         "my.subfile-001.age",
+			wantTarget:    "my",
+			wantNum:       "001",
+			wantExt:       "",
+			wantEncrypted: true,
 		},
 		{
 			name:    "regular file",
@@ -57,13 +72,13 @@ func TestParseSubfileName(t *testing.T) {
 			wantNil: true,
 		},
 		{
-			name:    "no number",
-			input:   ".bashrc.subfile-.sh",
+			name:    "no digits after dash",
+			input:   ".subfile-.bashrc",
 			wantNil: true,
 		},
 		{
-			name:    "missing ext after number",
-			input:   ".bashrc.subfile-010",
+			name:    "bare subfile no stem no ext",
+			input:   ".subfile-010",
 			wantNil: true,
 		},
 		{
