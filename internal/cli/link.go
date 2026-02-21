@@ -35,8 +35,8 @@ func newLinkCmd() *cobra.Command {
 			}
 
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"linked: %d created, %d updated, %d unchanged\n",
-				result.Created, result.Updated, result.Unchanged)
+				"linked: %d created, %d updated, %d unchanged, %d removed\n",
+				result.Created, result.Updated, result.Unchanged, result.Removed)
 			return nil
 		},
 	}

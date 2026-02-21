@@ -40,6 +40,8 @@ type LinkResult struct {
 	Updated int
 	// Unchanged is the number of symlinks already up to date.
 	Unchanged int
+	// Removed is the number of orphaned symlinks and compiled files removed.
+	Removed int
 }
 
 // StatusKind classifies the current state of a managed symlink.
@@ -84,10 +86,16 @@ var (
 
 // Link creates or refreshes symlinks from compiled files to TargetDir.
 // Conflicts (target exists but is not a symlink to the source) return an error.
+// Orphans (state entries with no corresponding file in files) are removed.
 func Link(ctx context.Context, cfg LinkConfig, files []FileRef) (*LinkResult, error) {
 	s, err := state.Load(ctx, cfg.CompileDir)
 	if err != nil {
 		return nil, fmt.Errorf("link: load state: %w", err)
+	}
+
+	currentFiles := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		currentFiles[f.RelPath] = struct{}{}
 	}
 
 	result := &LinkResult{}
@@ -97,12 +105,47 @@ func Link(ctx context.Context, cfg LinkConfig, files []FileRef) (*LinkResult, er
 		}
 	}
 
+	if err = removeOrphans(cfg, s, currentFiles, result); err != nil {
+		return nil, err
+	}
+
 	if !cfg.DryRun {
 		if err = state.Save(ctx, s, cfg.CompileDir); err != nil {
 			return nil, fmt.Errorf("link: save state: %w", err)
 		}
 	}
 	return result, nil
+}
+
+// removeOrphans removes symlinks, compiled files, and state entries for paths
+// present in state but absent from currentFiles.
+func removeOrphans(
+	cfg LinkConfig,
+	s *state.State,
+	currentFiles map[string]struct{},
+	r *LinkResult,
+) error {
+	for relPath, entry := range s.Symlinks {
+		if _, ok := currentFiles[relPath]; ok {
+			continue
+		}
+		if cfg.DryRun {
+			r.Removed++
+			continue
+		}
+		targetPath := filepath.Join(cfg.TargetDir, entry.Target)
+		if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove orphan symlink %s: %w", targetPath, err)
+		}
+		removeEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
+		sourcePath := filepath.Join(cfg.CompileDir, entry.Source)
+		if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove orphan compiled %s: %w", sourcePath, err)
+		}
+		delete(s.Symlinks, relPath)
+		r.Removed++
+	}
+	return nil
 }
 
 // linkFile processes a single FileRef within a Link call.
