@@ -36,6 +36,18 @@ func writeState(t *testing.T, compileDir, relPath, hash string) {
 	}
 }
 
+// writeStateMulti writes a state file with multiple relPath→hash entries.
+func writeStateMulti(t *testing.T, compileDir string, entries map[string]string) {
+	t.Helper()
+	s := state.New()
+	for relPath, hash := range entries {
+		s.Symlinks[relPath] = state.SymlinkEntry{Source: relPath, Target: relPath, ContentHash: hash}
+	}
+	if err := state.Save(context.Background(), s, compileDir); err != nil {
+		t.Fatalf("Save state: %v", err)
+	}
+}
+
 // writeCorruptState writes a file that is not valid JSON.
 func writeCorruptState(t *testing.T, compileDir string) {
 	t.Helper()
@@ -360,6 +372,228 @@ func TestLink_StaleNoStateEntry(t *testing.T) {
 	}
 	if result.Updated != 1 {
 		t.Errorf("result.Updated = %d, want 1", result.Updated)
+	}
+}
+
+// ---- removeOrphans tests ----------------------------------------------------
+
+func TestLink_RemoveOrphan(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash1 := writeCompiled(t, compileDir, ".bashrc", "export A=1\n")
+	hash2 := writeCompiled(t, compileDir, ".vimrc", "set noswap\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	makeSymlink(t, compileDir, targetDir, ".vimrc")
+	writeStateMulti(t, compileDir, map[string]string{".bashrc": hash1, ".vimrc": hash2})
+
+	ctx := context.Background()
+	result, err := Link(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{{RelPath: ".bashrc", ContentHash: hash1}})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Removed != 1 {
+		t.Errorf("result.Removed = %d, want 1", result.Removed)
+	}
+
+	// .vimrc symlink should be gone.
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".vimrc")); !os.IsNotExist(statErr) {
+		t.Error("expected .vimrc symlink to be removed")
+	}
+	// .vimrc compiled file should be gone.
+	if _, statErr := os.Lstat(filepath.Join(compileDir, ".vimrc")); !os.IsNotExist(statErr) {
+		t.Error("expected .vimrc compiled file to be removed")
+	}
+	// State should not contain .vimrc.
+	s, err := state.Load(ctx, compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if _, ok := s.Symlinks[".vimrc"]; ok {
+		t.Error("expected .vimrc removed from state")
+	}
+}
+
+func TestLink_RemoveOrphan_DryRun(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash1 := writeCompiled(t, compileDir, ".bashrc", "export A=1\n")
+	hash2 := writeCompiled(t, compileDir, ".vimrc", "set noswap\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	makeSymlink(t, compileDir, targetDir, ".vimrc")
+	writeStateMulti(t, compileDir, map[string]string{".bashrc": hash1, ".vimrc": hash2})
+
+	ctx := context.Background()
+	result, err := Link(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true},
+		[]FileRef{{RelPath: ".bashrc", ContentHash: hash1}})
+	if err != nil {
+		t.Fatalf("Link dry-run: %v", err)
+	}
+	if result.Removed != 1 {
+		t.Errorf("result.Removed = %d, want 1", result.Removed)
+	}
+
+	// .vimrc symlink should still exist.
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".vimrc")); statErr != nil {
+		t.Errorf("expected .vimrc symlink to remain after dry-run, got: %v", statErr)
+	}
+	// .vimrc compiled file should still exist.
+	if _, statErr := os.Lstat(filepath.Join(compileDir, ".vimrc")); statErr != nil {
+		t.Errorf("expected .vimrc compiled file to remain after dry-run, got: %v", statErr)
+	}
+	// State should still contain .vimrc (dry-run: no state save).
+	s, err := state.Load(ctx, compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if _, ok := s.Symlinks[".vimrc"]; !ok {
+		t.Error("expected .vimrc to remain in state after dry-run")
+	}
+}
+
+func TestLink_RemoveOrphan_NestedPath(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compileDir, ".config/git/config", "[core]\n")
+	makeSymlink(t, compileDir, targetDir, ".config/git/config")
+	writeState(t, compileDir, ".config/git/config", hash)
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Removed != 1 {
+		t.Errorf("result.Removed = %d, want 1", result.Removed)
+	}
+
+	// Symlink and empty parent dirs should be removed.
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".config", "git", "config")); !os.IsNotExist(statErr) {
+		t.Error("expected symlink to be removed")
+	}
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".config", "git")); !os.IsNotExist(statErr) {
+		t.Error("expected empty dir .config/git to be removed")
+	}
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".config")); !os.IsNotExist(statErr) {
+		t.Error("expected empty dir .config to be removed")
+	}
+	// Compiled file should be removed.
+	if _, statErr := os.Lstat(filepath.Join(compileDir, ".config", "git", "config")); !os.IsNotExist(statErr) {
+		t.Error("expected compiled file to be removed")
+	}
+}
+
+func TestLink_RemoveOrphan_AlreadyGone(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	// State has an entry, but no files exist on disk.
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	ctx := context.Background()
+	result, err := Link(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Removed != 1 {
+		t.Errorf("result.Removed = %d, want 1", result.Removed)
+	}
+
+	s, err := state.Load(ctx, compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if len(s.Symlinks) != 0 {
+		t.Errorf("state has %d entries after orphan removal, want 0", len(s.Symlinks))
+	}
+}
+
+func TestLink_RemoveOrphan_SymlinkRemoveError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", hash)
+
+	orig := osRemoveFunc
+	t.Cleanup(func() { osRemoveFunc = orig })
+	osRemoveFunc = func(path string) error {
+		if filepath.Dir(path) == targetDir {
+			return fmt.Errorf("forced remove error")
+		}
+		return orig(path)
+	}
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{})
+	if err == nil {
+		t.Fatal("expected error removing orphan symlink, got nil")
+	}
+}
+
+func TestLink_RemoveOrphan_CompiledRemoveError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", hash)
+
+	orig := osRemoveFunc
+	t.Cleanup(func() { osRemoveFunc = orig })
+	osRemoveFunc = func(path string) error {
+		if filepath.Dir(path) == compileDir {
+			return fmt.Errorf("forced remove error")
+		}
+		return orig(path)
+	}
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{})
+	if err == nil {
+		t.Fatal("expected error removing orphan compiled file, got nil")
+	}
+}
+
+func TestLink_RemoveOrphan_Mixed(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash1 := writeCompiled(t, compileDir, ".bashrc", "export A=1\n")
+	hash2 := writeCompiled(t, compileDir, ".vimrc", "set noswap\n")
+	hash3 := writeCompiled(t, compileDir, ".gitconfig", "[user]\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	makeSymlink(t, compileDir, targetDir, ".vimrc")
+	makeSymlink(t, compileDir, targetDir, ".gitconfig")
+	writeStateMulti(t, compileDir, map[string]string{
+		".bashrc": hash1, ".vimrc": hash2, ".gitconfig": hash3,
+	})
+
+	ctx := context.Background()
+	result, err := Link(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{
+			{RelPath: ".bashrc", ContentHash: hash1},
+			{RelPath: ".gitconfig", ContentHash: hash3},
+		})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Removed != 1 {
+		t.Errorf("result.Removed = %d, want 1", result.Removed)
+	}
+
+	// .vimrc should be gone.
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".vimrc")); !os.IsNotExist(statErr) {
+		t.Error("expected .vimrc symlink to be removed")
+	}
+	// .bashrc and .gitconfig should still be present.
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".bashrc")); statErr != nil {
+		t.Errorf("expected .bashrc symlink to remain, got: %v", statErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".gitconfig")); statErr != nil {
+		t.Errorf("expected .gitconfig symlink to remain, got: %v", statErr)
+	}
+	// State should have 2 entries.
+	s, err := state.Load(ctx, compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if len(s.Symlinks) != 2 {
+		t.Errorf("state has %d entries, want 2", len(s.Symlinks))
 	}
 }
 

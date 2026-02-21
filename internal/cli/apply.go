@@ -56,9 +56,9 @@ func newApplyCmd() *cobra.Command {
 			}
 
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"compiled: %d written, %d unchanged; linked: %d created, %d updated, %d unchanged\n",
+				"compiled: %d written, %d unchanged; linked: %d created, %d updated, %d unchanged, %d removed\n",
 				stats.Written, stats.Unchanged,
-				linkResult.Created, linkResult.Updated, linkResult.Unchanged)
+				linkResult.Created, linkResult.Updated, linkResult.Unchanged, linkResult.Removed)
 			return nil
 		},
 	}
