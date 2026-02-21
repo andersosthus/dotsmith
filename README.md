@@ -99,7 +99,7 @@ How each shell loads completions:
 | `status` | Report the status of managed symlinks |
 | `identity` | Print the resolved OS, hostname, username, and user@host |
 | `clean` | Remove managed symlinks and compiled files |
-| `git install` | Append dotsmith hook to `post-merge` and `post-checkout` |
+| `git install` | Append dotsmith hook to `post-merge` and `post-checkout`; `--branch <name>` restricts the hook to that branch |
 | `git remove` | Remove dotsmith hook from `post-merge` and `post-checkout` |
 | `shell <bash\|zsh\|fish>` | Generate shell completion script |
 | `version` | Print the dotsmith version |
@@ -334,6 +334,27 @@ creating the files if they don't exist:
 dotsmith apply --verbose || true
 # --- dotsmith hook end ---
 ```
+
+### Branch-restricted hooks
+
+To only run `dotsmith apply` when the current branch matches a specific name, pass `--branch`:
+
+```sh
+dotsmith git install --branch main
+```
+
+This wraps the apply call in a branch guard:
+
+```sh
+# --- dotsmith hook begin ---
+if [ "$(git branch --show-current)" = "main" ]; then
+  dotsmith apply --verbose || true
+fi
+# --- dotsmith hook end ---
+```
+
+Useful when you keep feature branches in your dotfiles repo and want to avoid recompiling while
+working on experimental changes.
 
 Remove the hooks:
 
