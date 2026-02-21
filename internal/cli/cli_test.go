@@ -129,7 +129,7 @@ func TestPersistentPreRunE_InvalidConfig(t *testing.T) {
 
 func TestCompileCmd_Success(t *testing.T) {
 	root := makeDotfiles(t)
-	writeSubfile(t, root, ".bashrc.subfile-010.sh", "export PATH=/usr/bin\n")
+	writeSubfile(t, root, ".subfile-010.bashrc", "export PATH=/usr/bin\n")
 	compileDir := t.TempDir()
 
 	out, err := run(t,
@@ -177,7 +177,7 @@ func TestCompileCmd_WriteError(t *testing.T) {
 
 func TestCompileCmd_DryRun(t *testing.T) {
 	root := makeDotfiles(t)
-	writeSubfile(t, root, ".bashrc.subfile-010.sh", "export A=1\n")
+	writeSubfile(t, root, ".subfile-010.bashrc", "export A=1\n")
 	compileDir := t.TempDir()
 
 	_, err := run(t, "--dotfiles-dir", root, "--dry-run", "compile",
@@ -196,7 +196,7 @@ func TestCompileCmd_DryRun(t *testing.T) {
 
 func TestLinkCmd_Success(t *testing.T) {
 	root := makeDotfiles(t)
-	writeSubfile(t, root, ".bashrc.subfile-010.sh", "export A=1\n")
+	writeSubfile(t, root, ".subfile-010.bashrc", "export A=1\n")
 	compileDir := t.TempDir()
 	targetDir := t.TempDir()
 
@@ -262,7 +262,7 @@ func TestLinkCmd_CompiledFileRefsError(t *testing.T) {
 
 func TestApplyCmd_Success(t *testing.T) {
 	root := makeDotfiles(t)
-	writeSubfile(t, root, ".bashrc.subfile-010.sh", "export B=2\n")
+	writeSubfile(t, root, ".subfile-010.bashrc", "export B=2\n")
 
 	_, err := run(t,
 		"--dotfiles-dir", root,
@@ -321,7 +321,7 @@ func TestApplyCmd_LinkError(t *testing.T) {
 
 func TestRenderCmd_Success(t *testing.T) {
 	root := makeDotfiles(t)
-	writeSubfile(t, root, "aliases.sh.subfile-010.sh", "alias ll='ls -la'\n")
+	writeSubfile(t, root, "aliases.subfile-010.sh", "alias ll='ls -la'\n")
 
 	out, err := runWithDotfiles(t, root, "render", "aliases.sh")
 	if err != nil {

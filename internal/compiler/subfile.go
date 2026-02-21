@@ -7,18 +7,27 @@ import (
 
 // subfilePattern matches the naming convention:
 //
-//	<target>.<subfile-NNN>.<ext>[.age]
+//	<stem>.subfile-NNN[.<ext>][.age]
 //
-// Groups: (1) target filename, (2) number string, (3) .ext, (4) .age or "".
-var subfilePattern = regexp.MustCompile(`^(.+)\.subfile-(\d+)(\.[^.]+)(\.age)?$`)
+// Examples:
+//
+//	config.subfile-001.fish  → stem="config", ext=".fish",   target="config.fish"
+//	.subfile-010.bashrc      → stem="",       ext=".bashrc", target=".bashrc"
+//	my.subfile-001           → stem="my",     ext="",        target="my"
+//
+// Groups: (1) stem (may be empty), (2) number string, (3) .ext (may be empty), (4) .age or "".
+// Group 3 uses a lazy optional (`??`) so that a trailing .age is captured by group 4, not group 3.
+var subfilePattern = regexp.MustCompile(`^(.*?)\.subfile-(\d+)(\.[^.]+)??(\.age)?$`)
 
 // SubfileInfo holds the parsed components of a subfile name.
 type SubfileInfo struct {
-	// Target is the output filename (e.g. ".bashrc").
+	// Target is the stem portion of the filename (e.g. "config" for "config.subfile-001.fish",
+	// "" for ".subfile-010.bashrc"). The compiled target path is Target + Ext.
 	Target string
 	// Number is the raw digit string from the subfile name (e.g. "020").
 	Number string
-	// Ext is the file extension after the number (e.g. ".sh").
+	// Ext is the target extension (e.g. ".fish" for "config.subfile-001.fish",
+	// ".bashrc" for ".subfile-010.bashrc", "" for "my.subfile-001").
 	Ext string
 	// Encrypted is true if the subfile has an .age suffix.
 	Encrypted bool
@@ -27,10 +36,14 @@ type SubfileInfo struct {
 }
 
 // ParseSubfileName parses a filename into SubfileInfo. Returns nil if the name
-// does not match the subfile naming convention.
+// does not match the subfile naming convention or would produce an empty target.
 func ParseSubfileName(name string) *SubfileInfo {
 	m := subfilePattern.FindStringSubmatch(name)
 	if m == nil {
+		return nil
+	}
+	// Reject .subfile-NNN with no stem and no ext — would compile to an empty target.
+	if m[1] == "" && m[3] == "" {
 		return nil
 	}
 	return &SubfileInfo{

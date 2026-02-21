@@ -44,7 +44,7 @@ func encryptFile(t *testing.T, path string, plaintext string, ks encrypt.KeySour
 func TestCompile_SingleSubfile(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".bashrc.subfile-010.sh", "export PATH=/usr/bin\n")
+	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "export PATH=/usr/bin\n")
 
 	ctx := context.Background()
 	cfg := CompileConfig{
@@ -68,8 +68,8 @@ func TestCompile_WithCommentHeaders(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
 	// aliases.sh has a .sh extension, so comment headers will be inserted.
-	writeFile(t, filepath.Join(root, "base"), "aliases.sh.subfile-010.sh", "alias ll='ls -la'\n")
-	writeFile(t, filepath.Join(root, "base"), "aliases.sh.subfile-020.sh", "alias gs='git status'\n")
+	writeFile(t, filepath.Join(root, "base"), "aliases.subfile-010.sh", "alias ll='ls -la'\n")
+	writeFile(t, filepath.Join(root, "base"), "aliases.subfile-020.sh", "alias gs='git status'\n")
 
 	ctx := context.Background()
 	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}}
@@ -93,6 +93,27 @@ func TestCompile_WithCommentHeaders(t *testing.T) {
 	}
 	if !strings.Contains(content, "alias gs=") {
 		t.Error("expected subfile-020 content in output")
+	}
+}
+
+func TestCompile_SubfilePreservesTargetExtension(t *testing.T) {
+	// Targets with extensions use the full target name in the subfile filename,
+	// e.g. config.fish.subfile-001.fish compiles to config.fish.
+	root := t.TempDir()
+	makeDir(t, root, "base")
+	writeFile(t, filepath.Join(root, "base"), "config.subfile-001.fish", "# 001\n")
+	writeFile(t, filepath.Join(root, "base"), "config.subfile-050.fish", "# 050\n")
+
+	ctx := context.Background()
+	result, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(result.Files) != 1 {
+		t.Fatalf("len(Files) = %d, want 1", len(result.Files))
+	}
+	if result.Files[0].RelPath != "config.fish" {
+		t.Errorf("RelPath = %q, want %q", result.Files[0].RelPath, "config.fish")
 	}
 }
 
@@ -138,7 +159,7 @@ func TestCompile_EncryptedSubfile(t *testing.T) {
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
 	// Create the plain file and encrypt it.
-	encryptFile(t, filepath.Join(base, ".bashrc.subfile-040.sh"), "export SECRET=hi\n", ks)
+	encryptFile(t, filepath.Join(base, ".subfile-040.bashrc"), "export SECRET=hi\n", ks)
 
 	ctx := context.Background()
 	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks}
@@ -176,7 +197,7 @@ func TestCompile_DecryptionFailure(t *testing.T) {
 
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
-	encryptFile(t, filepath.Join(base, ".bashrc.subfile-010.sh"), "secret\n", ks1)
+	encryptFile(t, filepath.Join(base, ".subfile-010.bashrc"), "secret\n", ks1)
 
 	ctx := context.Background()
 	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks2}
@@ -189,7 +210,7 @@ func TestCompile_DecryptionFailure(t *testing.T) {
 func TestCompile_ReadError(t *testing.T) {
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
-	path := filepath.Join(base, ".bashrc.subfile-010.sh")
+	path := filepath.Join(base, ".subfile-010.bashrc")
 	if err := os.WriteFile(path, []byte("data"), 0o000); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -205,7 +226,7 @@ func TestCompile_ReadError(t *testing.T) {
 func TestWriteCompiled_IdempotentSameContent(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".bashrc.subfile-010.sh", "export A=1\n")
+	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "export A=1\n")
 
 	ctx := context.Background()
 	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}}
@@ -242,8 +263,8 @@ func TestWriteCompiled_Permissions(t *testing.T) {
 
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".bashrc.subfile-010.sh", "export A=1\n")
-	encryptFile(t, filepath.Join(base, ".secret.subfile-001.sh"), "secret\n", ks)
+	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "export A=1\n")
+	encryptFile(t, filepath.Join(base, ".subfile-001.secret"), "secret\n", ks)
 
 	ctx := context.Background()
 	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks}
@@ -280,7 +301,7 @@ func TestWriteCompiled_Permissions(t *testing.T) {
 func TestWriteCompiled_DryRun(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".bashrc.subfile-010.sh", "export A=1\n")
+	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "export A=1\n")
 
 	ctx := context.Background()
 	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}}
@@ -309,7 +330,7 @@ func TestWriteCompiled_DryRun(t *testing.T) {
 func TestWriteCompiled_CompileDirPermissions(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".bashrc.subfile-010.sh", "data\n")
+	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "data\n")
 
 	ctx := context.Background()
 	result, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}})
@@ -334,7 +355,7 @@ func TestWriteCompiled_CompileDirPermissions(t *testing.T) {
 func TestWriteCompiled_MkdirError(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".bashrc.subfile-010.sh", "data\n")
+	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "data\n")
 
 	ctx := context.Background()
 	result, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}})
@@ -373,6 +394,9 @@ func TestCompile_EncryptedRegularFile(t *testing.T) {
 		t.Fatalf("len(Files) = %d, want 1", len(result.Files))
 	}
 	cf := result.Files[0]
+	if cf.RelPath != ".secret" {
+		t.Errorf("RelPath = %q, want %q", cf.RelPath, ".secret")
+	}
 	if !strings.Contains(string(cf.Content), "top secret") {
 		t.Errorf("expected decrypted content, got: %q", cf.Content)
 	}
@@ -458,7 +482,7 @@ func TestWriteCompiled_NestedMkdirError(t *testing.T) {
 func TestWriteCompiled_WriteError(t *testing.T) {
 	root := t.TempDir()
 	makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".bashrc.subfile-010.sh", "export A=1\n")
+	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "export A=1\n")
 
 	ctx := context.Background()
 	result, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}})
