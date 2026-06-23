@@ -51,18 +51,17 @@ type Config struct {
 }
 
 // Load reads and merges configuration from disk and the provided flags.
-// Discovery order: <dotfilesDir>/.dotsmith.yml → ~/.dotsmith.yml → flags.
-// Missing config files are silently ignored.
+// Discovery order (first existing file wins): --config →
+// $XDG_CONFIG_HOME/dotsmith/config.yml → ~/.dotsmith.yml, then flags override.
+// The repo-local <dotfilesDir>/.dotsmith.yml is never read: configuration is a
+// user-level concern only, so an untrusted dotfiles repo cannot redirect the
+// age identity, compile/target directories, or identity. Missing config files
+// are silently ignored.
 func Load(_ context.Context, flags Flags) (Config, error) {
 	v := viper.New()
 	setDefaults(v)
 
-	dotfilesDir := flags.DotfilesDir
-	if dotfilesDir == "" {
-		dotfilesDir = expandHome(v.GetString("dotfiles_dir"))
-	}
-
-	if err := loadConfigFiles(v, flags.ConfigPath, dotfilesDir); err != nil {
+	if err := loadConfigFiles(v, flags.ConfigPath); err != nil {
 		return Config{}, err
 	}
 
@@ -72,7 +71,7 @@ func Load(_ context.Context, flags Flags) (Config, error) {
 	}
 
 	return Config{
-		DotfilesDir: coalesce(dotfilesDir, expandHome(v.GetString("dotfiles_dir"))),
+		DotfilesDir: coalesce(flags.DotfilesDir, expandHome(v.GetString("dotfiles_dir"))),
 		CompileDir:  coalesce(flags.CompileDir, expandHome(v.GetString("compile_dir"))),
 		TargetDir:   coalesce(flags.TargetDir, expandHome(v.GetString("target_dir"))),
 		Identity:    id,
@@ -90,8 +89,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("age.identity_file", "~/.dotsmith-age-key")
 }
 
-// loadConfigFiles adds config sources in precedence order (lowest first).
-func loadConfigFiles(v *viper.Viper, explicitPath, dotfilesDir string) error {
+// loadConfigFiles reads the single applicable user-level config file into v.
+// An explicit --config path takes precedence; otherwise the first existing file
+// in userConfigSearchPaths wins. A file that exists but is invalid is an error;
+// a missing file is silently ignored. The repo-local config is never consulted.
+func loadConfigFiles(v *viper.Viper, explicitPath string) error {
 	if explicitPath != "" {
 		v.SetConfigFile(expandHome(explicitPath))
 		if err := v.ReadInConfig(); err != nil {
@@ -100,8 +102,7 @@ func loadConfigFiles(v *viper.Viper, explicitPath, dotfilesDir string) error {
 		return nil
 	}
 
-	// Load repo config. Skip silently if file is absent; error if present but invalid.
-	for _, path := range configSearchPaths(dotfilesDir) {
+	for _, path := range userConfigSearchPaths() {
 		if _, statErr := os.Stat(path); statErr != nil {
 			continue // file does not exist or is inaccessible
 		}
@@ -109,22 +110,34 @@ func loadConfigFiles(v *viper.Viper, explicitPath, dotfilesDir string) error {
 		if err := v.ReadInConfig(); err != nil {
 			return fmt.Errorf("load config %s: %w", path, err)
 		}
-		break
+		return nil // first existing file wins
 	}
-
-	// Try ~/.dotsmith.yml on top of any repo config.
-	homeConf := filepath.Join(userHomeDir(), ".dotsmith.yml")
-	v.SetConfigFile(homeConf)
-	_ = v.MergeInConfig() // silently ignore missing file
 
 	return nil
 }
 
-// configSearchPaths returns the ordered list of config file paths to check.
-func configSearchPaths(dotfilesDir string) []string {
+// userConfigSearchPaths returns the ordered list of user-level config paths to
+// check, highest precedence first.
+func userConfigSearchPaths() []string {
 	return []string{
-		filepath.Join(dotfilesDir, ".dotsmith.yml"),
+		filepath.Join(xdgConfigHome(), "dotsmith", "config.yml"),
+		filepath.Join(userHomeDir(), ".dotsmith.yml"),
 	}
+}
+
+// UserConfigPath returns the preferred location for the user's config file:
+// $XDG_CONFIG_HOME/dotsmith/config.yml (default ~/.config/dotsmith/config.yml).
+// It is where `dotsmith init` writes the config template.
+func UserConfigPath() string {
+	return userConfigSearchPaths()[0]
+}
+
+// xdgConfigHome returns $XDG_CONFIG_HOME, falling back to ~/.config.
+func xdgConfigHome() string {
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		return dir
+	}
+	return filepath.Join(userHomeDir(), ".config")
 }
 
 // resolveIdentity builds an Identity from Viper config, falling back to

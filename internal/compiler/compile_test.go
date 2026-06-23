@@ -1,13 +1,16 @@
 package compiler
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"filippo.io/age"
+	"filippo.io/age/armor"
 
 	"github.com/andersosthus/dotsmith/internal/encrypt"
 	"github.com/andersosthus/dotsmith/internal/identity"
@@ -29,15 +32,39 @@ func generateKey(t *testing.T) (keyPath string, ks encrypt.KeySource) {
 	return keyPath, ks
 }
 
-// encryptFile encrypts plaintext and writes it to path.
+// encryptFile encrypts plaintext to <path>.age for the recipient in ks. The
+// encrypt code path was removed from the encrypt package, so tests build the
+// armored age ciphertext directly.
 func encryptFile(t *testing.T, path string, plaintext string, ks encrypt.KeySource) {
 	t.Helper()
-	ctx := context.Background()
-	if err := os.WriteFile(path, []byte(plaintext), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	keyData, err := os.ReadFile(ks.IdentityFile)
+	if err != nil {
+		t.Fatalf("ReadFile key: %v", err)
 	}
-	if err := encrypt.EncryptFileInPlace(ctx, path, ks); err != nil {
-		t.Fatalf("EncryptFileInPlace: %v", err)
+	ids, err := age.ParseIdentities(bytes.NewReader(keyData))
+	if err != nil {
+		t.Fatalf("ParseIdentities: %v", err)
+	}
+	rec := ids[0].(*age.X25519Identity).Recipient()
+
+	var buf bytes.Buffer
+	aw := armor.NewWriter(&buf)
+	w, err := age.Encrypt(aw, rec)
+	if err != nil {
+		t.Fatalf("age.Encrypt: %v", err)
+	}
+	if _, err = io.WriteString(w, plaintext); err != nil {
+		t.Fatalf("write plaintext: %v", err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatalf("close age writer: %v", err)
+	}
+	if err = aw.Close(); err != nil {
+		t.Fatalf("close armor writer: %v", err)
+	}
+
+	if err = os.WriteFile(path+".age", buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("WriteFile age: %v", err)
 	}
 }
 

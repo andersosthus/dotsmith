@@ -94,7 +94,6 @@ How each shell loads completions:
 | `link` | Create symlinks from the compile directory to the target directory |
 | `apply` | Compile dotfiles and link them to the target directory (compile + link) |
 | `render <relpath>` | Compile a single dotfile and print it to stdout |
-| `encrypt <file>` | Encrypt a file with age, writing `<file>.age` and removing the original |
 | `decrypt <file.age>` | Decrypt an age-encrypted file and print it to stdout |
 | `status` | Report the status of managed symlinks |
 | `identity` | Print the resolved OS, hostname, username, and user@host |
@@ -108,7 +107,7 @@ How each shell loads completions:
 
 | Flag | Description |
 |------|-------------|
-| `--config <path>` | Path to `.dotsmith.yml` (overrides default search) |
+| `--config <path>` | Path to a config file (overrides default search) |
 | `--dotfiles-dir <path>` | Path to dotfiles repository |
 | `--compile-dir <path>` | Path to compiled output directory |
 | `--target-dir <path>` | Path to symlink target directory |
@@ -122,8 +121,6 @@ A dotsmith repository looks like this:
 
 ```
 ~/.dotfiles/
-├── .dotsmith.yml          # repo-level config (optional)
-│
 ├── base/                  # applied to every machine
 │   ├── .profile           # regular file — copied as-is
 │   ├── .subfile-010.bashrc             # subfile fragment 010
@@ -227,7 +224,7 @@ base  →  os/<goos>  →  hostname/<host>  →  username/<user>  →  userhost/
 | `hostname` | `os.Hostname()`, domain suffix stripped |
 | `username` | `user.Current().Username` |
 
-Override any field in `.dotsmith.yml`:
+Override any field in your config file:
 
 ```yaml
 identity:
@@ -238,20 +235,26 @@ identity:
 
 ## Configuration
 
-Config is loaded from two files (lowest to highest precedence), then CLI flags override both:
+Configuration is a **user-level** concern and is read only from the locations below — never from
+a `.dotsmith.yml` inside the dotfiles repository. This keeps a cloned or adopted repo from
+redirecting security-sensitive settings (the age identity, compile/target directories) on your
+machine.
 
-1. `<dotfiles-dir>/.dotsmith.yml` — repo-level config
-2. `~/.dotsmith.yml` — user-level config (merged on top)
-3. CLI flags — highest precedence
+The first file found is used (highest precedence first):
 
-Missing files are silently ignored. If `--config` is given, only that file is loaded.
+1. `--config <path>` — explicit path (when given, only this file is loaded)
+2. `$XDG_CONFIG_HOME/dotsmith/config.yml` (default `~/.config/dotsmith/config.yml`)
+3. `~/.dotsmith.yml` — legacy fallback
+
+CLI flags override the loaded file. Missing files are silently ignored, and a `.dotsmith.yml`
+committed inside the repo is ignored. Run `dotsmith init` to scaffold a config at location 2.
 
 **Full YAML schema:**
 
 ```yaml
 # Path to the dotfiles repository.
 # Default: ~/.dotfiles
-dotfiles_dir: ~/dotfiles
+dotfiles_dir: ~/.dotfiles
 
 # Directory where compiled output is written. Kept private (mode 0700).
 # Default: ~/.dotcompiled
@@ -291,18 +294,22 @@ age:
 
 ## Encryption
 
-Dotsmith uses [age](https://age-encryption.org) for file encryption. Encrypted files carry an
-`.age` extension and participate in the override system the same way as plaintext files.
+Dotsmith uses [age](https://age-encryption.org) to **decrypt** files during compilation. Encrypted
+files carry an `.age` extension and participate in the override system the same way as plaintext
+files. Dotsmith does not encrypt files for you — encrypt them yourself with `age` (or `rage`) before
+adding them to the repo, using the recipient that matches your identity file.
 
-**Key resolution order:**
+**Key resolution order (for decryption):**
 1. `age.identity_file` from config (or `--age-identity` flag)
 2. `~/.dotsmith-age-key` (default location)
 
-**Encrypt a file:**
+**Encrypt a file (with the standalone `age` tool):**
 
 ```sh
-dotsmith encrypt base/.ssh/config
-# writes base/.ssh/config.age and removes base/.ssh/config
+# Derive your recipient from the identity file, then encrypt to it.
+RECIPIENT=$(age-keygen -y ~/.dotsmith-age-key)
+age -a -r "$RECIPIENT" -o base/.ssh/config.age base/.ssh/config
+rm base/.ssh/config        # keep only the .age file in the repo
 ```
 
 **Inspect an encrypted file:**

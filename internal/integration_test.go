@@ -5,9 +5,11 @@
 package internal_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"testing"
 
 	"filippo.io/age"
+	"filippo.io/age/armor"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
@@ -168,6 +171,40 @@ func generateKey(t *testing.T) string {
 	return keyPath
 }
 
+// encryptToAge writes armored age ciphertext of plaintext to agePath for the
+// recipient in keyPath.
+func encryptToAge(t *testing.T, keyPath, agePath, plaintext string) {
+	t.Helper()
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("ReadFile key: %v", err)
+	}
+	ids, err := age.ParseIdentities(bytes.NewReader(keyData))
+	if err != nil {
+		t.Fatalf("ParseIdentities: %v", err)
+	}
+	rec := ids[0].(*age.X25519Identity).Recipient()
+
+	var buf bytes.Buffer
+	aw := armor.NewWriter(&buf)
+	w, err := age.Encrypt(aw, rec)
+	if err != nil {
+		t.Fatalf("age.Encrypt: %v", err)
+	}
+	if _, err = io.WriteString(w, plaintext); err != nil {
+		t.Fatalf("write plaintext: %v", err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatalf("close age writer: %v", err)
+	}
+	if err = aw.Close(); err != nil {
+		t.Fatalf("close armor writer: %v", err)
+	}
+	if err = os.WriteFile(agePath, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("WriteFile age: %v", err)
+	}
+}
+
 // --- Integration tests ---
 
 // TestIntegration_FullCycle: compile → link → status → clean.
@@ -283,14 +320,9 @@ func TestIntegration_EncryptionCycle(t *testing.T) {
 	keyPath := generateKey(t)
 	s := newScenario(t)
 
-	plainFile := filepath.Join(s.dotfiles, "base", "secrets.subfile-010.sh")
-	if err := os.WriteFile(plainFile, []byte("export SECRET=hunter2\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	agePath := filepath.Join(s.dotfiles, "base", "secrets.subfile-010.sh.age")
+	encryptToAge(t, keyPath, agePath, "export SECRET=hunter2\n")
 	ks := encrypt.KeySource{IdentityFile: keyPath}
-	if err := encrypt.EncryptFileInPlace(ctx, plainFile, ks); err != nil {
-		t.Fatalf("EncryptFileInPlace: %v", err)
-	}
 
 	result, err := compiler.Compile(ctx, compiler.CompileConfig{
 		DotfilesDir: s.dotfiles,

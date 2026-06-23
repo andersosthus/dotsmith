@@ -53,7 +53,6 @@ func NewRootCmd() *cobra.Command {
 		newLinkCmd(),
 		newApplyCmd(),
 		newRenderCmd(),
-		newEncryptCmd(),
 		newDecryptCmd(),
 		newStatusCmd(),
 		newIdentityCmd(),
