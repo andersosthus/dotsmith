@@ -52,6 +52,18 @@ func Load(_ context.Context, compileDir string) (*State, error) {
 	if err = json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("load state from %s: parse JSON: %w", path, err)
 	}
+	// Reject entries whose paths escape their directory (e.g. "../"). A state
+	// file is only trusted to reference files within the compile/target dirs;
+	// non-local paths would let a crafted state file delete arbitrary files.
+	for k, e := range s.Symlinks {
+		if !filepath.IsLocal(e.Target) || !filepath.IsLocal(e.Source) {
+			return nil, fmt.Errorf(
+				"load state from %s: entry %q has non-local path (source=%q target=%q) — "+
+					"refusing a state file that escapes its directory",
+				path, k, e.Source, e.Target,
+			)
+		}
+	}
 	if s.Symlinks == nil {
 		s.Symlinks = make(map[string]SymlinkEntry)
 	}

@@ -26,15 +26,16 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
+	// Source/Target are repo-relative paths (as written by the linker).
 	original := New()
-	original.Symlinks["/home/user/.bashrc"] = SymlinkEntry{
-		Source:      "/home/user/.dotcompiled/.bashrc",
-		Target:      "/home/user/.bashrc",
+	original.Symlinks[".bashrc"] = SymlinkEntry{
+		Source:      ".bashrc",
+		Target:      ".bashrc",
 		ContentHash: "abc123",
 	}
-	original.Symlinks["/home/user/.vimrc"] = SymlinkEntry{
-		Source:      "/home/user/.dotcompiled/.vimrc",
-		Target:      "/home/user/.vimrc",
+	original.Symlinks[".config/nvim/init.vim"] = SymlinkEntry{
+		Source:      ".config/nvim/init.vim",
+		Target:      ".config/nvim/init.vim",
 		ContentHash: "def456",
 	}
 
@@ -110,6 +111,58 @@ func TestLoad_NullSymlinks(t *testing.T) {
 	}
 	if s.Symlinks == nil {
 		t.Error("Symlinks should be initialised to empty map, not nil")
+	}
+}
+
+func TestLoad_NonLocalPathsRejected(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		json string
+	}{
+		{
+			name: "target escapes with ..",
+			json: `{"symlinks":{"e":{"source":"x","target":"../.ssh/authorized_keys","content_hash":"d"}}}`,
+		},
+		{
+			name: "source escapes with ..",
+			json: `{"symlinks":{"e":{"source":"../etc/passwd","target":"x","content_hash":"d"}}}`,
+		},
+		{
+			name: "target is absolute",
+			json: `{"symlinks":{"e":{"source":"x","target":"/etc/passwd","content_hash":"d"}}}`,
+		},
+		{
+			name: "source is absolute",
+			json: `{"symlinks":{"e":{"source":"/abs/path","target":"x","content_hash":"d"}}}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, stateFile), []byte(tc.json), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			if _, err := Load(ctx, dir); err == nil {
+				t.Fatal("expected error for non-local path, got nil")
+			}
+		})
+	}
+}
+
+func TestLoad_LocalPathsAccepted(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	jsonData := `{"symlinks":{".bashrc":{"source":".bashrc","target":".bashrc","content_hash":"d"}}}`
+	if err := os.WriteFile(filepath.Join(dir, stateFile), []byte(jsonData), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s, err := Load(ctx, dir)
+	if err != nil {
+		t.Fatalf("Load of local-path state should succeed, got: %v", err)
+	}
+	if len(s.Symlinks) != 1 {
+		t.Errorf("expected 1 entry, got %d", len(s.Symlinks))
 	}
 }
 

@@ -6,12 +6,14 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+
+	"github.com/andersosthus/dotsmith/internal/config"
 )
 
-// defaultDotsmithYML is the content written to .dotsmith.yml on init.
+// defaultDotsmithYML is the content written to the user config file on init.
 const defaultDotsmithYML = `# dotsmith configuration
-# dotfiles_dir: ~/dotfiles  # defaults to current directory
-# compile_dir: ~/.dotsmith/compiled
+# dotfiles_dir: ~/.dotfiles  # defaults to ~/.dotfiles
+# compile_dir: ~/.dotcompiled
 # target_dir: ~
 # age:
 #   identity_file: ~/.dotsmith-age-key
@@ -41,12 +43,16 @@ func newInitCmd() *cobra.Command {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "created: %s\n", dir)
 			}
 
-			cfgPath := filepath.Join(dotfilesDir, ".dotsmith.yml")
+			// Config lives outside the repo, at the user-level location.
+			cfgPath := config.UserConfigPath()
 			if cfg.DryRun {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "would create: %s\n", cfgPath)
 				return nil
 			}
 			if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+				if err = osMkdirAllInitFunc(filepath.Dir(cfgPath), 0o755); err != nil {
+					return fmt.Errorf("init: create %s: %w", filepath.Dir(cfgPath), err)
+				}
 				if err = os.WriteFile(cfgPath, []byte(defaultDotsmithYML), 0o644); err != nil {
 					return fmt.Errorf("init: create %s: %w", cfgPath, err)
 				}

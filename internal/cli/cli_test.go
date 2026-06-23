@@ -11,13 +11,29 @@ import (
 	"testing"
 
 	"filippo.io/age"
+	"filippo.io/age/armor"
 	"github.com/spf13/cobra"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
+	"github.com/andersosthus/dotsmith/internal/config"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
 	"github.com/andersosthus/dotsmith/internal/identity"
 	"github.com/andersosthus/dotsmith/internal/linker"
 )
+
+// TestMain isolates the user config environment so the developer's real
+// ~/.config/dotsmith/config.yml or ~/.dotsmith.yml cannot leak into tests.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "dotsmith-cli-test-home")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv("HOME", dir)
+	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -61,6 +77,44 @@ func generateAgeKey(t *testing.T) string {
 		t.Fatalf("WriteFile key: %v", err)
 	}
 	return path
+}
+
+// writeAgeFile encrypts content to <plainPath>.age for the recipient in keyPath
+// and returns the .age path. Used to set up decrypt-command tests now that the
+// encrypt command has been removed.
+func writeAgeFile(t *testing.T, keyPath, plainPath, content string) string {
+	t.Helper()
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("ReadFile key: %v", err)
+	}
+	ids, err := age.ParseIdentities(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ParseIdentities: %v", err)
+	}
+	rec := ids[0].(*age.X25519Identity).Recipient()
+
+	var buf bytes.Buffer
+	aw := armor.NewWriter(&buf)
+	w, err := age.Encrypt(aw, rec)
+	if err != nil {
+		t.Fatalf("age.Encrypt: %v", err)
+	}
+	if _, err = io.WriteString(w, content); err != nil {
+		t.Fatalf("write plaintext: %v", err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatalf("close age writer: %v", err)
+	}
+	if err = aw.Close(); err != nil {
+		t.Fatalf("close armor writer: %v", err)
+	}
+
+	agePath := plainPath + ".age"
+	if err = os.WriteFile(agePath, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("WriteFile age: %v", err)
+	}
+	return agePath
 }
 
 // writeSubfile writes a subfile into the dotfiles dir's base layer.
@@ -114,14 +168,27 @@ func TestExecute_Success(t *testing.T) {
 }
 
 func TestPersistentPreRunE_InvalidConfig(t *testing.T) {
+	// Invalid YAML in an explicit --config file must surface as an error.
+	bad := filepath.Join(t.TempDir(), "bad.yml")
+	if err := os.WriteFile(bad, []byte("not: valid: yaml: {"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := run(t, "--config", bad, "compile")
+	if err == nil {
+		t.Fatal("expected error from invalid config, got nil")
+	}
+}
+
+func TestPersistentPreRunE_RepoConfigIgnored(t *testing.T) {
+	// A malformed repo-local .dotsmith.yml must be ignored, not read.
 	root := makeDotfiles(t)
-	// Write invalid YAML config.
 	if err := os.WriteFile(filepath.Join(root, ".dotsmith.yml"), []byte("not: valid: yaml: {"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	_, err := runWithDotfiles(t, root, "compile")
-	if err == nil {
-		t.Fatal("expected error from invalid config, got nil")
+	out, err := runWithDotfiles(t, root, "compile",
+		"--compile-dir", t.TempDir(), "--target-dir", t.TempDir())
+	if err != nil {
+		t.Fatalf("compile should ignore repo config, got: %v (out=%q)", err, out)
 	}
 }
 
@@ -362,75 +429,14 @@ func TestRenderCmd_MissingArg(t *testing.T) {
 	}
 }
 
-// ---- encrypt/decrypt --------------------------------------------------------
-
-func TestEncryptCmd_Success(t *testing.T) {
-	keyPath := generateAgeKey(t)
-	plainFile := filepath.Join(t.TempDir(), "secret.txt")
-	if err := os.WriteFile(plainFile, []byte("top secret\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	out, err := run(t, "--age-identity", keyPath, "encrypt", plainFile)
-	if err != nil {
-		t.Fatalf("encrypt: %v", err)
-	}
-	if !strings.Contains(out, "encrypted") {
-		t.Errorf("encrypt output = %q, want 'encrypted'", out)
-	}
-	if _, statErr := os.Stat(plainFile + ".age"); statErr != nil {
-		t.Errorf("expected .age file, got: %v", statErr)
-	}
-}
-
-func TestEncryptCmd_AlreadyAge(t *testing.T) {
-	_, err := run(t, "encrypt", "/some/file.age")
-	if err == nil {
-		t.Fatal("expected error for .age extension, got nil")
-	}
-}
-
-func TestEncryptCmd_KeyFileMissing(t *testing.T) {
-	plain := filepath.Join(t.TempDir(), "file.txt")
-	if err := os.WriteFile(plain, []byte("data"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	_, err := run(t, "--age-identity", "/nonexistent/age.key", "encrypt", plain)
-	if err == nil {
-		t.Fatal("expected error for missing key file, got nil")
-	}
-}
-
-func TestEncryptCmd_EncryptError(t *testing.T) {
-	keyPath := generateAgeKey(t)
-	orig := encryptFileInPlaceFunc
-	t.Cleanup(func() { encryptFileInPlaceFunc = orig })
-	encryptFileInPlaceFunc = func(_ context.Context, _ string, _ encrypt.KeySource) error {
-		return fmt.Errorf("forced encrypt error")
-	}
-
-	plain := filepath.Join(t.TempDir(), "file.txt")
-	if err := os.WriteFile(plain, []byte("data"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	_, err := run(t, "--age-identity", keyPath, "encrypt", plain)
-	if err == nil {
-		t.Fatal("expected error from encryptFunc, got nil")
-	}
-}
+// ---- decrypt ----------------------------------------------------------------
 
 func TestDecryptCmd_Success(t *testing.T) {
 	keyPath := generateAgeKey(t)
 	plainFile := filepath.Join(t.TempDir(), "secret.txt")
-	if err := os.WriteFile(plainFile, []byte("top secret\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	ks := encrypt.KeySource{IdentityFile: keyPath}
-	if err := encrypt.EncryptFileInPlace(context.Background(), plainFile, ks); err != nil {
-		t.Fatalf("EncryptFileInPlace: %v", err)
-	}
+	agePath := writeAgeFile(t, keyPath, plainFile, "top secret\n")
 
-	out, err := run(t, "--age-identity", keyPath, "decrypt", plainFile+".age")
+	out, err := run(t, "--age-identity", keyPath, "decrypt", agePath)
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
@@ -488,9 +494,9 @@ func TestIdentityCmd_Output(t *testing.T) {
 }
 
 func TestIdentityCmd_ConfigOverride(t *testing.T) {
-	root := makeDotfiles(t)
 	cfg := "identity:\n  hostname: override-host\n  username: override-user\n  os: override-os\n"
-	if err := os.WriteFile(filepath.Join(root, ".dotsmith.yml"), []byte(cfg), 0o644); err != nil {
+	cfgPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -500,7 +506,7 @@ func TestIdentityCmd_ConfigOverride(t *testing.T) {
 		return identity.Identity{OS: "linux", Hostname: "orighost", Username: "origuser"}, nil
 	}
 
-	out, err := runWithDotfiles(t, root, "identity")
+	out, err := run(t, "--config", cfgPath, "identity")
 	if err != nil {
 		t.Fatalf("identity: %v", err)
 	}
@@ -602,6 +608,7 @@ func TestCleanCmd_Error(t *testing.T) {
 // ---- init -------------------------------------------------------------------
 
 func TestInitCmd_Success(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	root := t.TempDir()
 	out, err := runWithDotfiles(t, root, "init")
 	if err != nil {
@@ -617,19 +624,26 @@ func TestInitCmd_Success(t *testing.T) {
 			t.Errorf("expected dir %s, got: %v", dir, statErr)
 		}
 	}
-	if _, statErr := os.Stat(filepath.Join(root, ".dotsmith.yml")); statErr != nil {
-		t.Errorf("expected .dotsmith.yml, got: %v", statErr)
+	// Config is written to the user-level location, not inside the repo.
+	if _, statErr := os.Stat(config.UserConfigPath()); statErr != nil {
+		t.Errorf("expected user config %s, got: %v", config.UserConfigPath(), statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ".dotsmith.yml")); statErr == nil {
+		t.Error("init must not write config inside the repo")
 	}
 }
 
 func TestInitCmd_ExistingConfig(t *testing.T) {
-	root := t.TempDir()
-	cfgPath := filepath.Join(root, ".dotsmith.yml")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfgPath := config.UserConfigPath()
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
 	if err := os.WriteFile(cfgPath, []byte("# existing\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	out, err := runWithDotfiles(t, root, "init")
+	out, err := runWithDotfiles(t, t.TempDir(), "init")
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -644,6 +658,7 @@ func TestInitCmd_ExistingConfig(t *testing.T) {
 }
 
 func TestInitCmd_DryRun(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	root := t.TempDir()
 	out, err := run(t, "--dotfiles-dir", root, "--dry-run", "init")
 	if err != nil {
@@ -656,6 +671,9 @@ func TestInitCmd_DryRun(t *testing.T) {
 	entries, _ := os.ReadDir(root)
 	if len(entries) != 0 {
 		t.Errorf("expected empty dir after dry-run init, got %d entries", len(entries))
+	}
+	if _, statErr := os.Stat(config.UserConfigPath()); statErr == nil {
+		t.Error("dry-run init must not write the user config")
 	}
 }
 
@@ -673,20 +691,36 @@ func TestInitCmd_MkdirError(t *testing.T) {
 }
 
 func TestInitCmd_WriteConfigError(t *testing.T) {
-	root := t.TempDir()
-	// Make the dotfiles dir read-only so WriteFile fails.
-	if err := os.Chmod(root, 0o555); err != nil {
-		t.Fatalf("Chmod: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+	// Point the config at a temp XDG dir but stub MkdirAll to a no-op so the
+	// parent directory is never created; WriteFile then fails.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	orig := osMkdirAllInitFunc
 	t.Cleanup(func() { osMkdirAllInitFunc = orig })
 	osMkdirAllInitFunc = func(string, os.FileMode) error { return nil }
 
-	_, err := run(t, "--dotfiles-dir", root, "init")
+	_, err := run(t, "--dotfiles-dir", t.TempDir(), "init")
 	if err == nil {
-		t.Fatal("expected error writing .dotsmith.yml, got nil")
+		t.Fatal("expected error writing user config, got nil")
+	}
+}
+
+func TestInitCmd_ConfigMkdirError(t *testing.T) {
+	// Let the repo layer dirs be created, but fail creating the config's parent.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	orig := osMkdirAllInitFunc
+	t.Cleanup(func() { osMkdirAllInitFunc = orig })
+	osMkdirAllInitFunc = func(path string, _ os.FileMode) error {
+		if strings.Contains(path, "dotsmith") {
+			return fmt.Errorf("forced config mkdir error")
+		}
+		return nil
+	}
+
+	_, err := run(t, "--dotfiles-dir", t.TempDir(), "init")
+	if err == nil {
+		t.Fatal("expected error creating config parent dir, got nil")
 	}
 }
 
