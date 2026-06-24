@@ -278,9 +278,12 @@ identity:
   hostname: workstation
   username: alice
 
-# Age encryption settings.
+# Age decryption settings.
 age:
-  identity_file: ~/.age/key.txt
+  identity_file: ~/.age/key.txt   # native age key (optional)
+  identities:                     # extra identity paths, any format (auto-detected)
+    - ~/.ssh/id_ed25519
+  ssh_discovery: true             # scan ~/.ssh for usable SSH keys (default: true)
 ```
 
 **Defaults:**
@@ -290,27 +293,62 @@ age:
 | `dotfiles_dir` | `~/.dotfiles` |
 | `compile_dir` | `~/.dotcompiled` |
 | `target_dir` | `~` |
-| `age.identity_file` | *(none — must be set to use encryption)* |
+| `age.identity_file` | `~/.dotsmith-age-key` (tolerated if absent) |
+| `age.identities` | *(empty)* |
+| `age.ssh_discovery` | `true` |
 
 ## Encryption
 
 Dotsmith uses [age](https://age-encryption.org) to **decrypt** files during compilation. Encrypted
 files carry an `.age` extension and participate in the override system the same way as plaintext
 files. Dotsmith does not encrypt files for you — encrypt them yourself with `age` (or `rage`) before
-adding them to the repo, using the recipient that matches your identity file.
+adding them to the repo, using a recipient that matches one of your identities.
 
-**Key resolution order (for decryption):**
-1. `age.identity_file` from config (or `--age-identity` flag)
-2. `~/.dotsmith-age-key` (default location)
+### Candidate identity set
 
-**Encrypt a file (with the standalone `age` tool):**
+Dotsmith does not decrypt with a single key. Each run it assembles a **candidate identity set** and
+hands the whole set to age, which matches the file's recipients against it and uses whichever key
+fits. The set is the union of:
+
+1. the native age identity at `age.identity_file` (or `--age-identity`); a **missing default**
+   `~/.dotsmith-age-key` is silently skipped, but a **missing explicitly configured** path is a hard
+   error,
+2. every path in `age.identities` (each auto-detected as a native age or SSH key), and
+3. SSH private keys discovered in `~/.ssh/` when `age.ssh_discovery` is `true` (the default).
+
+Supported SSH key types are exactly those age supports: `ssh-ed25519` and `ssh-rsa` (≥ 2048-bit).
+Discovery skips `config`, `authorized_keys`, `known_hosts*`, `*.pub`, sockets, directories, and any
+key age can't use (ecdsa, dsa, FIDO, undersized RSA) — silently, unless `--verbose` is set. Set
+`age.ssh_discovery: false` to disable `~/.ssh/` scanning entirely.
+
+### Decrypt with SSH keys on every machine, zero config
+
+Because a single `.age` file can be encrypted to several SSH public keys at once, you can commit one
+encrypted file and have each machine decrypt it with the SSH key it already has — no per-machine age
+key to distribute:
 
 ```sh
-# Derive your recipient from the identity file, then encrypt to it.
-RECIPIENT=$(age-keygen -y ~/.dotsmith-age-key)
-age -a -r "$RECIPIENT" -o base/.ssh/config.age base/.ssh/config
+# On each machine, grab its public key once (out of band).
+# machine-a.pub, machine-b.pub, ...
+
+# Encrypt to all machines' SSH public keys with the standalone age tool.
+age -a \
+  -R machine-a.pub -R machine-b.pub \
+  -o base/.ssh/config.age base/.ssh/config
 rm base/.ssh/config        # keep only the .age file in the repo
 ```
+
+On machine A the file opens with A's `~/.ssh/id_ed25519`; on machine B with B's — from the same
+committed file, with no dotsmith configuration. You can also encrypt to a native age recipient:
+
+```sh
+RECIPIENT=$(age-keygen -y ~/.dotsmith-age-key)
+age -a -r "$RECIPIENT" -o base/.ssh/config.age base/.ssh/config
+```
+
+> **ssh-agent is not and cannot be supported.** age's SSH decryption needs the private key itself to
+> perform the Ed25519→X25519 conversion and ECDH (or RSAES-OAEP), operations ssh-agent will not do —
+> it only signs. Use an unencrypted SSH key for non-interactive (git-hook) compiles.
 
 **Inspect an encrypted file:**
 
@@ -318,10 +356,15 @@ rm base/.ssh/config        # keep only the .age file in the repo
 dotsmith decrypt base/.ssh/config.age
 ```
 
-Decrypted content is printed to stdout. The `.age` file is not removed.
+`dotsmith decrypt` uses the same candidate-set resolution as `compile`. Decrypted content is printed
+to stdout; the `.age` file is not removed.
+
+If no identity matches a file, dotsmith reports the file and the identities it tried (path and type),
+so you know to re-encrypt including this machine's recipient.
 
 During `compile` and `apply`, encrypted subfiles and regular files are decrypted in memory and
-written with mode `0600` in the compile directory.
+written with mode `0600` in the compile directory; decrypted content is never written back into the
+dotfiles repo.
 
 ## Git hooks
 

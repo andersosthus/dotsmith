@@ -21,8 +21,9 @@ type CompileConfig struct {
 	DotfilesDir string
 	// Identity is the resolved identity for override layer selection.
 	Identity identity.Identity
-	// KeySource describes how to decrypt age-encrypted files.
-	KeySource encrypt.KeySource
+	// Identities is the resolved candidate identity set for decrypting
+	// age-encrypted files. It is built once per run and shared across all files.
+	Identities encrypt.IdentitySet
 }
 
 // CompiledFile represents a single file in the compiled output.
@@ -67,7 +68,7 @@ func Compile(ctx context.Context, cfg CompileConfig) (*CompileResult, error) {
 
 	result := &CompileResult{}
 	for _, entry := range discovered {
-		cf, compileErr := compileEntry(ctx, entry, cfg.KeySource)
+		cf, compileErr := compileEntry(ctx, entry, cfg.Identities)
 		if compileErr != nil {
 			return nil, fmt.Errorf("compile %s: %w", entry.Target, compileErr)
 		}
@@ -77,15 +78,15 @@ func Compile(ctx context.Context, cfg CompileConfig) (*CompileResult, error) {
 }
 
 // compileEntry assembles the content of a single FileEntry.
-func compileEntry(ctx context.Context, entry *FileEntry, ks encrypt.KeySource) (*CompiledFile, error) {
+func compileEntry(ctx context.Context, entry *FileEntry, set encrypt.IdentitySet) (*CompiledFile, error) {
 	if entry.IsRegular {
-		return compileRegular(ctx, entry, ks)
+		return compileRegular(ctx, entry, set)
 	}
-	return compileSubfiles(ctx, entry, ks)
+	return compileSubfiles(ctx, entry, set)
 }
 
 // compileRegular copies a regular (non-subfile) file as-is.
-func compileRegular(ctx context.Context, entry *FileEntry, ks encrypt.KeySource) (*CompiledFile, error) {
+func compileRegular(ctx context.Context, entry *FileEntry, set encrypt.IdentitySet) (*CompiledFile, error) {
 	if len(entry.Subfiles) == 0 {
 		return nil, fmt.Errorf("regular file entry has no source")
 	}
@@ -93,7 +94,7 @@ func compileRegular(ctx context.Context, entry *FileEntry, ks encrypt.KeySource)
 	var content []byte
 	var err error
 	if sf.Encrypted {
-		content, err = encrypt.DecryptFile(ctx, sf.SourcePath, ks)
+		content, err = encrypt.DecryptFile(ctx, sf.SourcePath, set)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt %s: %w", sf.SourcePath, err)
 		}
@@ -112,7 +113,7 @@ func compileRegular(ctx context.Context, entry *FileEntry, ks encrypt.KeySource)
 }
 
 // compileSubfiles assembles the content of a subfile target.
-func compileSubfiles(ctx context.Context, entry *FileEntry, ks encrypt.KeySource) (*CompiledFile, error) {
+func compileSubfiles(ctx context.Context, entry *FileEntry, set encrypt.IdentitySet) (*CompiledFile, error) {
 	// Validate: check for duplicate subfile numbers (shouldn't happen after
 	// Discover, but guard defensively).
 	if err := validateNoDuplicates(entry); err != nil {
@@ -132,7 +133,7 @@ func compileSubfiles(ctx context.Context, entry *FileEntry, ks encrypt.KeySource
 
 		if sf.Encrypted {
 			fromEncrypted = true
-			content, err = encrypt.DecryptFile(ctx, sf.SourcePath, ks)
+			content, err = encrypt.DecryptFile(ctx, sf.SourcePath, set)
 			if err != nil {
 				return nil, fmt.Errorf("decrypt %s: %w", sf.SourcePath, err)
 			}

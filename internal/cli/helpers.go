@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -8,11 +9,37 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/andersosthus/dotsmith/internal/config"
+	"github.com/andersosthus/dotsmith/internal/encrypt"
 	"github.com/andersosthus/dotsmith/internal/linker"
 )
 
 // Injectable for testing.
-var filepathRelHelpersFunc = filepath.Rel
+var (
+	filepathRelHelpersFunc = filepath.Rel
+	resolveIdentitiesFunc  = encrypt.Resolve
+)
+
+// keySourceFor builds the encrypt.KeySource from the resolved config.
+func keySourceFor(cfg config.Config) encrypt.KeySource {
+	return encrypt.KeySource{
+		IdentityFile:         cfg.AgeIdentity,
+		IdentityFileExplicit: cfg.AgeIdentityExplicit,
+		Identities:           cfg.AgeIdentities,
+		SSHDiscovery:         cfg.AgeSSHDiscovery,
+		Verbose:              cfg.Verbose,
+	}
+}
+
+// resolveIdentitySet builds the candidate identity set once for a run, wiring
+// the terminal prompter for any passphrase-protected SSH key.
+func resolveIdentitySet(ctx context.Context, cfg config.Config) (encrypt.IdentitySet, error) {
+	set, err := resolveIdentitiesFunc(ctx, keySourceFor(cfg), encrypt.TerminalPrompter{})
+	if err != nil {
+		return encrypt.IdentitySet{}, fmt.Errorf("resolve identities: %w", err)
+	}
+	return set, nil
+}
 
 // compiledFileRefs walks compileDir and returns a FileRef for every compiled
 // file (skipping the state file and any hidden metadata).

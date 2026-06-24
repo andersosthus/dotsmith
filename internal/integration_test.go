@@ -322,12 +322,18 @@ func TestIntegration_EncryptionCycle(t *testing.T) {
 
 	agePath := filepath.Join(s.dotfiles, "base", "secrets.subfile-010.sh.age")
 	encryptToAge(t, keyPath, agePath, "export SECRET=hunter2\n")
-	ks := encrypt.KeySource{IdentityFile: keyPath}
+	set, err := encrypt.Resolve(ctx, encrypt.KeySource{
+		IdentityFile:         keyPath,
+		IdentityFileExplicit: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
 
 	result, err := compiler.Compile(ctx, compiler.CompileConfig{
 		DotfilesDir: s.dotfiles,
 		Identity:    mustDetect(t),
-		KeySource:   ks,
+		Identities:  set,
 	})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)

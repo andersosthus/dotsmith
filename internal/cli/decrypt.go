@@ -25,8 +25,12 @@ func newDecryptCmd() *cobra.Command {
 				return fmt.Errorf("decrypt: %s does not have .age extension", path)
 			}
 
-			ks := encrypt.KeySource{IdentityFile: cfg.AgeIdentity}
-			content, err := decryptFileFunc(cmd.Context(), path, ks)
+			set, err := resolveIdentitySet(cmd.Context(), cfg)
+			if err != nil {
+				return fmt.Errorf("decrypt %s: %w", path, err)
+			}
+
+			content, err := decryptFileFunc(cmd.Context(), path, set)
 			if err != nil {
 				return fmt.Errorf("decrypt %s: %w", path, err)
 			}

@@ -361,6 +361,93 @@ func TestLoad_DetectError(t *testing.T) {
 	}
 }
 
+func TestLoad_AgeDefaults(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	c, err := Load(ctx, Flags{DotfilesDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	home, _ := os.UserHomeDir()
+	if c.AgeIdentity != filepath.Join(home, ".dotsmith-age-key") {
+		t.Errorf("AgeIdentity = %q, want default", c.AgeIdentity)
+	}
+	if c.AgeIdentityExplicit {
+		t.Error("AgeIdentityExplicit should be false when using the default")
+	}
+	if !c.AgeSSHDiscovery {
+		t.Error("AgeSSHDiscovery should default to true")
+	}
+	if len(c.AgeIdentities) != 0 {
+		t.Errorf("AgeIdentities = %v, want empty by default", c.AgeIdentities)
+	}
+}
+
+func TestLoad_AgeIdentityExplicitFromFlag(t *testing.T) {
+	ctx := context.Background()
+	c, err := Load(ctx, Flags{DotfilesDir: t.TempDir(), AgeIdentity: "/flag/age.key"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.AgeIdentityExplicit {
+		t.Error("AgeIdentityExplicit should be true when set via flag")
+	}
+	if c.AgeIdentity != "/flag/age.key" {
+		t.Errorf("AgeIdentity = %q, want /flag/age.key", c.AgeIdentity)
+	}
+}
+
+func TestLoad_AgeIdentityExplicitFromConfig(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	writeConfig(t, UserConfigPath(), "age:\n  identity_file: /cfg/age.key\n")
+
+	c, err := Load(ctx, Flags{DotfilesDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.AgeIdentityExplicit {
+		t.Error("AgeIdentityExplicit should be true when set in config")
+	}
+	if c.AgeIdentity != "/cfg/age.key" {
+		t.Errorf("AgeIdentity = %q, want /cfg/age.key", c.AgeIdentity)
+	}
+}
+
+func TestLoad_AgeIdentitiesAndDiscovery(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	writeConfig(t, UserConfigPath(), "age:\n  ssh_discovery: false\n  identities:\n    - /abs/key1\n    - ~/key2\n")
+
+	c, err := Load(ctx, Flags{DotfilesDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.AgeSSHDiscovery {
+		t.Error("AgeSSHDiscovery should be false when configured off")
+	}
+	want := []string{"/abs/key1", filepath.Join(home, "key2")}
+	if len(c.AgeIdentities) != len(want) {
+		t.Fatalf("AgeIdentities = %v, want %v", c.AgeIdentities, want)
+	}
+	for i := range want {
+		if c.AgeIdentities[i] != want[i] {
+			t.Errorf("AgeIdentities[%d] = %q, want %q", i, c.AgeIdentities[i], want[i])
+		}
+	}
+}
+
+func TestExpandHomeAll_Empty(t *testing.T) {
+	if got := expandHomeAll(nil); got != nil {
+		t.Errorf("expandHomeAll(nil) = %v, want nil", got)
+	}
+}
+
 func TestExpandHome(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {

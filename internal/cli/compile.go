@@ -6,7 +6,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
-	"github.com/andersosthus/dotsmith/internal/encrypt"
 )
 
 // Injectable for testing.
@@ -23,10 +22,15 @@ func newCompileCmd() *cobra.Command {
 			cfg := mustGetCfg(cmd)
 			ctx := cmd.Context()
 
+			set, err := resolveIdentitySet(ctx, cfg)
+			if err != nil {
+				return fmt.Errorf("compile: %w", err)
+			}
+
 			compileCfg := compiler.CompileConfig{
 				DotfilesDir: cfg.DotfilesDir,
 				Identity:    cfg.Identity,
-				KeySource:   encrypt.KeySource{IdentityFile: cfg.AgeIdentity},
+				Identities:  set,
 			}
 			result, err := compileFunc(ctx, compileCfg)
 			if err != nil {

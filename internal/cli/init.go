@@ -16,7 +16,10 @@ const defaultDotsmithYML = `# dotsmith configuration
 # compile_dir: ~/.dotcompiled
 # target_dir: ~
 # age:
-#   identity_file: ~/.dotsmith-age-key
+#   identity_file: ~/.dotsmith-age-key  # native age key (optional)
+#   identities:                         # extra identity paths (age or SSH, auto-detected)
+#     - ~/.ssh/id_ed25519
+#   ssh_discovery: true                 # scan ~/.ssh for usable SSH keys (default: true)
 `
 
 // Injectable for testing.
