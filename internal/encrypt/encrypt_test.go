@@ -32,16 +32,38 @@ type fakePrompter struct {
 	passphrase  []byte
 	err         error
 	calls       int
+	// labels records the keyLabel passed to each Prompt call, so tests can assert
+	// the prompt named the matched key.
+	labels []string
 }
 
 func (p *fakePrompter) Interactive() bool { return p.interactive }
 
-func (p *fakePrompter) Prompt(_ string) ([]byte, error) {
+func (p *fakePrompter) Prompt(label string) ([]byte, error) {
 	p.calls++
+	p.labels = append(p.labels, label)
 	if p.err != nil {
 		return nil, p.err
 	}
 	return p.passphrase, nil
+}
+
+// seqPrompter returns a different passphrase on each call, in order, so tests can
+// exercise the wrong-then-right retry path. It is always interactive.
+type seqPrompter struct {
+	passphrases [][]byte
+	calls       int
+}
+
+func (p *seqPrompter) Interactive() bool { return true }
+
+func (p *seqPrompter) Prompt(_ string) ([]byte, error) {
+	idx := p.calls
+	p.calls++
+	if idx >= len(p.passphrases) {
+		return p.passphrases[len(p.passphrases)-1], nil
+	}
+	return p.passphrases[idx], nil
 }
 
 // generateAgeIdentity returns a fresh native age identity.
@@ -590,6 +612,211 @@ func TestResolve_EncryptedSSHKey_PromptError(t *testing.T) {
 	ct := encryptToRecipients(t, "x", sshRecipient(t, pub))
 	if _, derr := Decrypt(context.Background(), bytes.NewReader(ct), set); derr == nil {
 		t.Fatal("expected decrypt error when prompter fails, got nil")
+	}
+}
+
+func TestResolve_EncryptedSSHKey_InteractivePromptError(t *testing.T) {
+	// A terminal is present but reading the passphrase fails (e.g. read error).
+	// The error must propagate immediately, naming the key, without retrying.
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	keyPath, pub := writeEd25519Key(t, sshDir, "id_ed25519", []byte("pw"))
+
+	prompter := &fakePrompter{interactive: true, err: errors.New("read failure")}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ct := encryptToRecipients(t, "x", sshRecipient(t, pub))
+	_, derr := Decrypt(context.Background(), bytes.NewReader(ct), set)
+	if derr == nil {
+		t.Fatal("expected error when interactive prompt fails, got nil")
+	}
+	if prompter.calls != 1 {
+		t.Errorf("prompter called %d times, want 1 (prompt error is terminal, no retry)", prompter.calls)
+	}
+	if !bytes.Contains([]byte(derr.Error()), []byte(keyPath)) {
+		t.Errorf("error %q should name the key", derr)
+	}
+}
+
+func TestResolve_EncryptedSSHKey_NonMatchNeverPrompts(t *testing.T) {
+	// An encrypted key in the set whose tag does not match the file must return
+	// age.ErrIncorrectIdentity without prompting. With no other matching identity
+	// the decrypt fails with a no-match error, and the encrypted key is never
+	// unlocked. This exercises the non-match branch of the retrying wrapper.
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	writeEd25519Key(t, sshDir, "id_ed25519", []byte("pw"))
+
+	prompter := &fakePrompter{interactive: true, passphrase: []byte("pw")}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// File encrypted to a different SSH key the machine does not hold: the
+	// encrypted candidate's tag does not match, so it must not prompt.
+	otherDir := t.TempDir()
+	_, otherPub := writeEd25519Key(t, otherDir, "other", nil)
+	ct := encryptToRecipients(t, "x", sshRecipient(t, otherPub))
+	_, derr := Decrypt(context.Background(), bytes.NewReader(ct), set)
+	if derr == nil {
+		t.Fatal("expected no-match error, got nil")
+	}
+	if prompter.calls != 0 {
+		t.Errorf("prompter called %d times, want 0 (encrypted key did not match)", prompter.calls)
+	}
+}
+
+func TestResolve_EncryptedSSHKey_WrongThenRight(t *testing.T) {
+	// A wrong passphrase is retried; the correct one on the second attempt
+	// unlocks the key (≤3 attempts).
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	const pass = "correct-horse"
+	_, pub := writeEd25519Key(t, sshDir, "id_ed25519", []byte(pass))
+
+	prompter := &seqPrompter{passphrases: [][]byte{[]byte("wrong"), []byte(pass)}}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ct := encryptToRecipients(t, "retry secret", sshRecipient(t, pub))
+	out, derr := Decrypt(context.Background(), bytes.NewReader(ct), set)
+	if derr != nil {
+		t.Fatalf("Decrypt after retry: %v", derr)
+	}
+	if string(out) != "retry secret" {
+		t.Errorf("Decrypt = %q, want %q", out, "retry secret")
+	}
+	if prompter.calls != 2 {
+		t.Errorf("prompter called %d times, want 2 (one wrong, one right)", prompter.calls)
+	}
+}
+
+func TestResolve_EncryptedSSHKey_ExhaustsAttempts(t *testing.T) {
+	// Three wrong passphrases exhaust the attempt budget and fail with a clear
+	// error; the prompter is asked exactly maxPassphraseAttempts times.
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	_, pub := writeEd25519Key(t, sshDir, "id_ed25519", []byte("correct"))
+
+	prompter := &fakePrompter{interactive: true, passphrase: []byte("always-wrong")}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ct := encryptToRecipients(t, "x", sshRecipient(t, pub))
+	_, derr := Decrypt(context.Background(), bytes.NewReader(ct), set)
+	if derr == nil {
+		t.Fatal("expected error after exhausting passphrase attempts, got nil")
+	}
+	if prompter.calls != maxPassphraseAttempts {
+		t.Errorf("prompter called %d times, want %d", prompter.calls, maxPassphraseAttempts)
+	}
+	if !bytes.Contains([]byte(derr.Error()), []byte("attempts")) {
+		t.Errorf("error %q should mention exhausted attempts", derr)
+	}
+}
+
+func TestResolve_EncryptedSSHKey_PromptsOnlyMatchedKey(t *testing.T) {
+	// Two encrypted keys in the set; only the key that matches the file is ever
+	// prompted for. The non-matching key must not prompt.
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	matchedPath, matchedPub := writeEd25519Key(t, sshDir, "id_matched", []byte("pw-matched"))
+	writeEd25519Key(t, sshDir, "id_other", []byte("pw-other"))
+
+	prompter := &fakePrompter{interactive: true, passphrase: []byte("pw-matched")}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(set.identities) != 2 {
+		t.Fatalf("got %d identities, want 2", len(set.identities))
+	}
+
+	ct := encryptToRecipients(t, "matched", sshRecipient(t, matchedPub))
+	out, derr := Decrypt(context.Background(), bytes.NewReader(ct), set)
+	if derr != nil {
+		t.Fatalf("Decrypt: %v", derr)
+	}
+	if string(out) != "matched" {
+		t.Errorf("Decrypt = %q", out)
+	}
+	if prompter.calls != 1 {
+		t.Errorf("prompter called %d times, want 1 (only matched key prompts)", prompter.calls)
+	}
+	for _, label := range prompter.labels {
+		if label != matchedPath {
+			t.Errorf("prompted for %q, want only matched key %q", label, matchedPath)
+		}
+	}
+}
+
+func TestResolve_EncryptedSSHKey_NoTTYHardError(t *testing.T) {
+	// A matched encrypted key with no terminal must fail with a hard error naming
+	// the file and the key — never prompting and never hanging.
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	keyPath, pub := writeEd25519Key(t, sshDir, "id_ed25519", []byte("pw"))
+
+	prompter := &fakePrompter{interactive: false, passphrase: []byte("pw")}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	encPath := filepath.Join(t.TempDir(), "secret.age")
+	if werr := os.WriteFile(encPath, encryptToRecipients(t, "x", sshRecipient(t, pub)), 0o600); werr != nil {
+		t.Fatalf("WriteFile: %v", werr)
+	}
+
+	_, derr := DecryptFile(context.Background(), encPath, set)
+	if derr == nil {
+		t.Fatal("expected no-TTY hard error, got nil")
+	}
+	if prompter.calls != 0 {
+		t.Errorf("prompter called %d times with no TTY, want 0", prompter.calls)
+	}
+	if !bytes.Contains([]byte(derr.Error()), []byte(encPath)) {
+		t.Errorf("error %q should name the file", derr)
+	}
+	if !bytes.Contains([]byte(derr.Error()), []byte(keyPath)) {
+		t.Errorf("error %q should name the key", derr)
+	}
+	if !bytes.Contains([]byte(derr.Error()), []byte("no terminal")) {
+		t.Errorf("error %q should explain no terminal is available", derr)
+	}
+}
+
+func TestResolve_UnencryptedKey_DecryptsSilentlyNoTTY(t *testing.T) {
+	// The non-interactive (git-hook) path: an unencrypted matched key decrypts
+	// with no terminal and no prompt.
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	_, pub := writeEd25519Key(t, sshDir, "id_ed25519", nil)
+
+	prompter := &fakePrompter{interactive: false}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ct := encryptToRecipients(t, "silent", sshRecipient(t, pub))
+	out, derr := Decrypt(context.Background(), bytes.NewReader(ct), set)
+	if derr != nil {
+		t.Fatalf("Decrypt (no TTY, unencrypted): %v", derr)
+	}
+	if string(out) != "silent" {
+		t.Errorf("Decrypt = %q", out)
+	}
+	if prompter.calls != 0 {
+		t.Errorf("prompter called %d times for unencrypted key, want 0", prompter.calls)
 	}
 }
 

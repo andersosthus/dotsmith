@@ -231,14 +231,87 @@ func encryptedSSHIdentity(
 		return nil, "", err
 	}
 
-	label := path
-	id, err := agessh.NewEncryptedSSHIdentity(pub, data, func() ([]byte, error) {
-		return prompter.Prompt(label)
+	// pendingErr lets the passphrase callback surface a no-TTY hard error through
+	// agessh, which only propagates errors returned by the callback itself.
+	var pendingErr error
+	inner, err := agessh.NewEncryptedSSHIdentity(pub, data, func() ([]byte, error) {
+		if !prompter.Interactive() {
+			pendingErr = fmt.Errorf(
+				"passphrase required for %s but no terminal is available — "+
+					"run dotsmith interactively or use an unencrypted key", path,
+			)
+			return nil, pendingErr
+		}
+		pass, perr := prompter.Prompt(path)
+		if perr != nil {
+			pendingErr = fmt.Errorf("prompt passphrase for %s: %w", path, perr)
+			return nil, pendingErr
+		}
+		return pass, nil
 	})
 	if err != nil {
 		return nil, "", fmt.Errorf("build encrypted ssh identity: %w", err)
 	}
-	return id, typeSSHEncrypted, nil
+
+	return &retryingEncryptedIdentity{
+		inner:      inner,
+		keyLabel:   path,
+		pendingErr: &pendingErr,
+	}, typeSSHEncrypted, nil
+}
+
+// maxPassphraseAttempts is the number of times dotsmith prompts for an encrypted
+// key's passphrase before giving up.
+const maxPassphraseAttempts = 3
+
+// retryingEncryptedIdentity wraps an agessh.EncryptedSSHIdentity to add
+// dotsmith's interactivity policy: up to maxPassphraseAttempts passphrase
+// prompts, and a clear hard error when a matched encrypted key cannot be
+// unlocked (wrong passphrase exhausted, or no terminal available).
+//
+// agessh.EncryptedSSHIdentity.Unwrap calls the passphrase callback at most once
+// and aborts the whole decrypt on a wrong passphrase, so the retry loop lives
+// here: each Unwrap attempt re-runs the (lazy) callback. After the first
+// successful unlock agessh caches the decrypted key, so a key shared by many
+// files in one run prompts exactly once.
+type retryingEncryptedIdentity struct {
+	inner    age.Identity
+	keyLabel string
+	// pendingErr receives a hard error (no TTY, or prompt I/O failure) set by the
+	// passphrase callback; such errors must not be retried.
+	pendingErr *error
+}
+
+var _ age.Identity = (*retryingEncryptedIdentity)(nil)
+
+// Unwrap implements age.Identity. If the key's tag does not match any stanza it
+// returns age.ErrIncorrectIdentity unchanged (no prompt, letting age try the
+// next candidate). On a tag match it drives the prompt-and-unlock loop.
+func (r *retryingEncryptedIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxPassphraseAttempts; attempt++ {
+		*r.pendingErr = nil
+		fileKey, err := r.inner.Unwrap(stanzas)
+		if err == nil {
+			return fileKey, nil
+		}
+		// Non-matching key: hand age.ErrIncorrectIdentity straight back so age
+		// moves on to the next candidate without prompting.
+		if errors.Is(err, age.ErrIncorrectIdentity) {
+			return nil, err //nolint:wrapcheck // sentinel must propagate unwrapped for age
+		}
+		// A no-TTY or prompt-failure error from the callback is terminal — there
+		// is no point re-prompting.
+		if *r.pendingErr != nil {
+			return nil, *r.pendingErr
+		}
+		// Otherwise the passphrase was wrong (or the key failed to decrypt); retry.
+		lastErr = err
+	}
+	return nil, fmt.Errorf(
+		"incorrect passphrase for %s after %d attempts — verify the passphrase or use an unencrypted key: %w",
+		r.keyLabel, maxPassphraseAttempts, lastErr,
+	)
 }
 
 // readSiblingPub reads and parses the <path>.pub file next to an encrypted key.

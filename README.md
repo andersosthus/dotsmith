@@ -350,6 +350,22 @@ age -a -r "$RECIPIENT" -o base/.ssh/config.age base/.ssh/config
 > perform the Ed25519→X25519 conversion and ECDH (or RSAES-OAEP), operations ssh-agent will not do —
 > it only signs. Use an unencrypted SSH key for non-interactive (git-hook) compiles.
 
+### Passphrase-protected SSH keys
+
+If the SSH key that matches a file is passphrase-protected, dotsmith unlocks it lazily — only when a
+file's recipients actually match that key, and never for keys that don't match:
+
+- **On a terminal**, dotsmith prompts for the passphrase (up to three attempts) and unlocks the key
+  **once per run** — a repo with many `.age` files encrypted to the same key prompts only once. With
+  several keys in your set, only the key that matches the file is ever prompted for.
+- **With no terminal** (e.g. a git hook), a file that needs a passphrase-protected key fails with a
+  hard error naming the file and the key, rather than hanging. Files that match an unencrypted key
+  still decrypt silently, so non-interactive compiles keep working as long as the matching key is
+  unencrypted.
+
+The passphrase is read only from the terminal. Dotsmith deliberately **never** reads a key passphrase
+from an environment variable or a config field, so your passphrase is never parked in plaintext.
+
 **Inspect an encrypted file:**
 
 ```sh
