@@ -31,11 +31,14 @@ func newCompileCmd() *cobra.Command {
 				DotfilesDir: cfg.DotfilesDir,
 				Identity:    cfg.Identity,
 				Identities:  set,
+				DryRun:      cfg.DryRun,
 			}
 			result, err := compileFunc(ctx, compileCfg)
 			if err != nil {
 				return fmt.Errorf("compile: %w", err)
 			}
+
+			printDryRunReports(cmd.OutOrStdout(), result.DryRunReports)
 
 			writeCfg := compiler.WriteConfig{
 				CompileDir: cfg.CompileDir,

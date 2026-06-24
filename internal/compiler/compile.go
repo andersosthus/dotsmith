@@ -24,6 +24,11 @@ type CompileConfig struct {
 	// Identities is the resolved candidate identity set for decrypting
 	// age-encrypted files. It is built once per run and shared across all files.
 	Identities encrypt.IdentitySet
+	// DryRun, when true, makes Compile probe each age-encrypted source for the
+	// identity that would decrypt it instead of decrypting it. No passphrase is
+	// requested and no key is unlocked; the probe outcomes are returned in
+	// CompileResult.DryRunReports. Encrypted file content is left empty.
+	DryRun bool
 }
 
 // CompiledFile represents a single file in the compiled output.
@@ -38,9 +43,25 @@ type CompiledFile struct {
 	FromEncrypted bool
 }
 
+// DryRunReport records, for one age-encrypted source file, which identity would
+// decrypt it on this machine — gathered without unlocking or prompting.
+type DryRunReport struct {
+	// SourcePath is the .age source file that was probed.
+	SourcePath string
+	// Matched is true when a candidate identity would decrypt the file.
+	Matched bool
+	// IdentityPath is the source file of the matching identity (empty on no match).
+	IdentityPath string
+	// IdentityKind is the type label of the matching identity (empty on no match).
+	IdentityKind string
+}
+
 // CompileResult holds all compiled files from a single compile run.
 type CompileResult struct {
 	Files []CompiledFile
+	// DryRunReports holds one entry per age-encrypted source probed during a
+	// dry-run compile, in discovery order. It is empty for a normal compile.
+	DryRunReports []DryRunReport
 }
 
 // WriteConfig holds parameters for writing compiled output to disk.
@@ -68,56 +89,50 @@ func Compile(ctx context.Context, cfg CompileConfig) (*CompileResult, error) {
 
 	result := &CompileResult{}
 	for _, entry := range discovered {
-		cf, compileErr := compileEntry(ctx, entry, cfg.Identities)
+		cf, reports, compileErr := compileEntry(ctx, entry, cfg)
 		if compileErr != nil {
 			return nil, fmt.Errorf("compile %s: %w", entry.Target, compileErr)
 		}
 		result.Files = append(result.Files, *cf)
+		result.DryRunReports = append(result.DryRunReports, reports...)
 	}
 	return result, nil
 }
 
-// compileEntry assembles the content of a single FileEntry.
-func compileEntry(ctx context.Context, entry *FileEntry, set encrypt.IdentitySet) (*CompiledFile, error) {
+// compileEntry assembles the content of a single FileEntry, returning any dry-run
+// probe reports for age-encrypted sources it touched.
+func compileEntry(ctx context.Context, entry *FileEntry, cfg CompileConfig) (*CompiledFile, []DryRunReport, error) {
 	if entry.IsRegular {
-		return compileRegular(ctx, entry, set)
+		return compileRegular(ctx, entry, cfg)
 	}
-	return compileSubfiles(ctx, entry, set)
+	return compileSubfiles(ctx, entry, cfg)
 }
 
 // compileRegular copies a regular (non-subfile) file as-is.
-func compileRegular(ctx context.Context, entry *FileEntry, set encrypt.IdentitySet) (*CompiledFile, error) {
+func compileRegular(ctx context.Context, entry *FileEntry, cfg CompileConfig) (*CompiledFile, []DryRunReport, error) {
 	if len(entry.Subfiles) == 0 {
-		return nil, fmt.Errorf("regular file entry has no source")
+		return nil, nil, fmt.Errorf("regular file entry has no source")
 	}
 	sf := entry.Subfiles[0]
-	var content []byte
-	var err error
-	if sf.Encrypted {
-		content, err = encrypt.DecryptFile(ctx, sf.SourcePath, set)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt %s: %w", sf.SourcePath, err)
-		}
-	} else {
-		content, err = os.ReadFile(sf.SourcePath)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", sf.SourcePath, err)
-		}
+	content, report, err := sourceContent(ctx, sf, cfg)
+	if err != nil {
+		return nil, nil, err
 	}
-	return &CompiledFile{
+	cf := &CompiledFile{
 		RelPath:       entry.Target,
 		Content:       content,
 		ContentHash:   hashContent(content),
 		FromEncrypted: sf.Encrypted,
-	}, nil
+	}
+	return cf, reportsOf(report), nil
 }
 
 // compileSubfiles assembles the content of a subfile target.
-func compileSubfiles(ctx context.Context, entry *FileEntry, set encrypt.IdentitySet) (*CompiledFile, error) {
+func compileSubfiles(ctx context.Context, entry *FileEntry, cfg CompileConfig) (*CompiledFile, []DryRunReport, error) {
 	// Validate: check for duplicate subfile numbers (shouldn't happen after
 	// Discover, but guard defensively).
 	if err := validateNoDuplicates(entry); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Determine comment style from the target file extension.
@@ -126,22 +141,18 @@ func compileSubfiles(ctx context.Context, entry *FileEntry, set encrypt.Identity
 
 	var buf bytes.Buffer
 	fromEncrypted := false
+	var reports []DryRunReport
 
 	for _, sf := range entry.Subfiles {
-		var content []byte
-		var err error
-
+		content, report, err := sourceContent(ctx, sf, cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		if report != nil {
+			reports = append(reports, *report)
+		}
 		if sf.Encrypted {
 			fromEncrypted = true
-			content, err = encrypt.DecryptFile(ctx, sf.SourcePath, set)
-			if err != nil {
-				return nil, fmt.Errorf("decrypt %s: %w", sf.SourcePath, err)
-			}
-		} else {
-			content, err = os.ReadFile(sf.SourcePath)
-			if err != nil {
-				return nil, fmt.Errorf("read %s: %w", sf.SourcePath, err)
-			}
 		}
 
 		if style != nil {
@@ -152,12 +163,54 @@ func compileSubfiles(ctx context.Context, entry *FileEntry, set encrypt.Identity
 	}
 
 	assembled := buf.Bytes()
-	return &CompiledFile{
+	cf := &CompiledFile{
 		RelPath:       entry.Target,
 		Content:       assembled,
 		ContentHash:   hashContent(assembled),
 		FromEncrypted: fromEncrypted,
-	}, nil
+	}
+	return cf, reports, nil
+}
+
+// sourceContent returns the content of a single subfile. For an unencrypted
+// source it reads the file. For an encrypted source it decrypts normally, except
+// under DryRun where it instead probes (without unlocking or prompting) which
+// identity would decrypt the file, returning empty content and a DryRunReport.
+func sourceContent(ctx context.Context, sf SubfileDesc, cfg CompileConfig) ([]byte, *DryRunReport, error) {
+	if !sf.Encrypted {
+		content, err := os.ReadFile(sf.SourcePath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read %s: %w", sf.SourcePath, err)
+		}
+		return content, nil, nil
+	}
+
+	if cfg.DryRun {
+		res, err := cfg.Identities.DryRunProbeFile(ctx, sf.SourcePath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dry-run decrypt %s: %w", sf.SourcePath, err)
+		}
+		return nil, &DryRunReport{
+			SourcePath:   sf.SourcePath,
+			Matched:      res.Matched,
+			IdentityPath: res.Path,
+			IdentityKind: res.Kind,
+		}, nil
+	}
+
+	content, err := encrypt.DecryptFile(ctx, sf.SourcePath, cfg.Identities)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decrypt %s: %w", sf.SourcePath, err)
+	}
+	return content, nil, nil
+}
+
+// reportsOf wraps an optional single report into a slice for the caller.
+func reportsOf(r *DryRunReport) []DryRunReport {
+	if r == nil {
+		return nil
+	}
+	return []DryRunReport{*r}
 }
 
 // validateNoDuplicates returns an error if any subfile number appears twice.

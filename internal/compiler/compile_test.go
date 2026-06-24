@@ -219,7 +219,7 @@ func TestCompile_DuplicateSubfileError(t *testing.T) {
 			{Number: "010", SourcePath: "/fake2"},
 		},
 	}
-	_, err := compileSubfiles(context.Background(), entry, encrypt.IdentitySet{})
+	_, _, err := compileSubfiles(context.Background(), entry, CompileConfig{Identities: encrypt.IdentitySet{}})
 	if err == nil {
 		t.Fatal("expected error for duplicate subfile numbers, got nil")
 	}
@@ -469,7 +469,7 @@ func TestCompile_EncryptedRegularDecryptError(t *testing.T) {
 func TestCompile_EmptyRegularEntry(t *testing.T) {
 	// Edge case: a FileEntry with IsRegular=true but no subfiles.
 	entry := &FileEntry{Target: "empty", IsRegular: true, Subfiles: nil}
-	_, err := compileRegular(context.Background(), entry, encrypt.IdentitySet{})
+	_, _, err := compileRegular(context.Background(), entry, CompileConfig{Identities: encrypt.IdentitySet{}})
 	if err == nil {
 		t.Fatal("expected error for empty regular entry, got nil")
 	}

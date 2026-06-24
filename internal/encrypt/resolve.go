@@ -34,6 +34,9 @@ type candidate struct {
 	path string
 	// kind labels the identity format.
 	kind identityType
+	// probe reports, without unlocking or prompting, whether this candidate would
+	// decrypt a file given its recipient stanzas. It powers --dry-run reporting.
+	probe prober
 }
 
 // IdentitySet is the resolved candidate identity set for one dotsmith run. It is
@@ -59,9 +62,10 @@ type Prompter interface {
 
 // Injectable seams for testing discovery without touching the real machine.
 var (
-	sshDirFunc      = defaultSSHDir
-	listDirFunc     = defaultListDir
-	readKeyFileFunc = os.ReadFile
+	sshDirFunc         = defaultSSHDir
+	listDirFunc        = defaultListDir
+	readKeyFileFunc    = os.ReadFile
+	sshParsePrivateKey = ssh.ParsePrivateKey
 )
 
 // Resolve builds the candidate identity set from ks: the native age identity
@@ -103,7 +107,7 @@ func (s *IdentitySet) addNativeIdentity(ks KeySource) error {
 		return err
 	}
 	for _, id := range ids {
-		s.add(id, ks.IdentityFile, typeNativeAge)
+		s.add(id, ks.IdentityFile, typeNativeAge, nativeProbe{id: id})
 	}
 	return nil
 }
@@ -120,14 +124,14 @@ func (s *IdentitySet) addExplicitIdentities(ks KeySource) error {
 				path, err,
 			)
 		}
-		id, kind, err := parseIdentity(data, expanded, nil)
+		id, kind, probe, err := parseIdentity(data, expanded, nil)
 		if err != nil {
 			return fmt.Errorf(
 				"parse identity %s: %w — must be a native age or SSH (ed25519/rsa) key",
 				path, err,
 			)
 		}
-		s.add(id, path, kind)
+		s.add(id, path, kind, probe)
 	}
 	return nil
 }
@@ -173,12 +177,12 @@ func (s *IdentitySet) tryAddSSHKey(ks KeySource, path string, prompter Prompter)
 		return
 	}
 
-	id, kind, err := parseIdentity(data, path, prompter)
+	id, kind, probe, err := parseIdentity(data, path, prompter)
 	if err != nil {
 		s.logSkip(ks, path, err.Error())
 		return
 	}
-	s.add(id, path, kind)
+	s.add(id, path, kind, probe)
 }
 
 // parseIdentity classifies key bytes. A native age identity is detected via
@@ -186,17 +190,21 @@ func (s *IdentitySet) tryAddSSHKey(ks KeySource, path string, prompter Prompter)
 // classifier — dotsmith does no PEM-sniffing or key-type/size validation of its
 // own. A passphrase-protected SSH key becomes a lazily-unlocked identity when a
 // prompter is supplied.
-func parseIdentity(data []byte, path string, prompter Prompter) (age.Identity, identityType, error) {
+func parseIdentity(data []byte, path string, prompter Prompter) (age.Identity, identityType, prober, error) {
 	if id, ok := tryNativeAge(data); ok {
-		return id, typeNativeAge, nil
+		return id, typeNativeAge, nativeProbe{id: id}, nil
 	}
 
 	id, err := agessh.ParseIdentity(data)
 	if err == nil {
 		if usableErr := usableSSHIdentity(data); usableErr != nil {
-			return nil, "", usableErr
+			return nil, "", nil, usableErr
 		}
-		return id, sshKindFor(id), nil
+		probe, perr := sshProbeFromKey(data)
+		if perr != nil {
+			return nil, "", nil, perr
+		}
+		return id, sshKindFor(id), probe, nil
 	}
 
 	var pmErr *ssh.PassphraseMissingError
@@ -204,7 +212,18 @@ func parseIdentity(data []byte, path string, prompter Prompter) (age.Identity, i
 		return encryptedSSHIdentity(data, path, pmErr, prompter)
 	}
 
-	return nil, "", fmt.Errorf("not a usable age or SSH identity: %w", err)
+	return nil, "", nil, fmt.Errorf("not a usable age or SSH identity: %w", err)
+}
+
+// sshProbeFromKey recovers the SSH public key from an unencrypted private key's
+// bytes and builds the dry-run tag probe for it. The public key is the only
+// material the probe needs, so this performs no decryption.
+func sshProbeFromKey(data []byte) (prober, error) {
+	signer, err := sshParsePrivateKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("recover ssh public key for dry-run probe: %w", err)
+	}
+	return newSSHProbe(signer.PublicKey()), nil
 }
 
 // encryptedSSHIdentity builds a lazily-unlocked identity for a
@@ -213,9 +232,9 @@ func parseIdentity(data []byte, path string, prompter Prompter) (age.Identity, i
 // without either, or without a prompter, the key is unusable and skipped.
 func encryptedSSHIdentity(
 	data []byte, path string, pmErr *ssh.PassphraseMissingError, prompter Prompter,
-) (age.Identity, identityType, error) {
+) (age.Identity, identityType, prober, error) {
 	if prompter == nil {
-		return nil, "", errors.New("passphrase-protected key with no prompter available")
+		return nil, "", nil, errors.New("passphrase-protected key with no prompter available")
 	}
 
 	pub := pmErr.PublicKey
@@ -223,12 +242,12 @@ func encryptedSSHIdentity(
 		var err error
 		pub, err = readSiblingPub(path)
 		if err != nil {
-			return nil, "", fmt.Errorf("encrypted key without recoverable public key: %w", err)
+			return nil, "", nil, fmt.Errorf("encrypted key without recoverable public key: %w", err)
 		}
 	}
 
 	if err := usableSSHPublicKey(pub); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 
 	// pendingErr lets the passphrase callback surface a no-TTY hard error through
@@ -250,14 +269,14 @@ func encryptedSSHIdentity(
 		return pass, nil
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("build encrypted ssh identity: %w", err)
+		return nil, "", nil, fmt.Errorf("build encrypted ssh identity: %w", err)
 	}
 
 	return &retryingEncryptedIdentity{
 		inner:      inner,
 		keyLabel:   path,
 		pendingErr: &pendingErr,
-	}, typeSSHEncrypted, nil
+	}, typeSSHEncrypted, newSSHProbe(pub), nil
 }
 
 // maxPassphraseAttempts is the number of times dotsmith prompts for an encrypted
@@ -407,9 +426,9 @@ func sshKindFor(id age.Identity) identityType {
 }
 
 // add appends a resolved identity and its metadata to the set.
-func (s *IdentitySet) add(id age.Identity, path string, kind identityType) {
+func (s *IdentitySet) add(id age.Identity, path string, kind identityType, probe prober) {
 	s.identities = append(s.identities, id)
-	s.candidates = append(s.candidates, candidate{identity: id, path: path, kind: kind})
+	s.candidates = append(s.candidates, candidate{identity: id, path: path, kind: kind, probe: probe})
 }
 
 // logSkip records a discovery skip under verbose mode only; skips are otherwise
