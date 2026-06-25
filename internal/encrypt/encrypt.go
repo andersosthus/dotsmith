@@ -45,6 +45,8 @@ func Decrypt(_ context.Context, src io.Reader, set IdentitySet) ([]byte, error) 
 		return nil, emptySetError()
 	}
 
+	set.setDecryptSource("") // unnamed stream: a passphrase prompt names only the key
+
 	armorReader := armor.NewReader(src)
 	r, err := age.Decrypt(armorReader, set.identities...)
 	if err != nil {
@@ -70,6 +72,8 @@ func DecryptFile(ctx context.Context, path string, set IdentitySet) ([]byte, err
 		return nil, fmt.Errorf("decrypt file %s: %w", path, err)
 	}
 	defer f.Close() //nolint:errcheck // best-effort close on read-only file
+
+	set.setDecryptSource(path) // name this file in any SSH-key passphrase prompt
 
 	armorReader := armor.NewReader(f)
 	r, err := age.Decrypt(armorReader, set.identities...)

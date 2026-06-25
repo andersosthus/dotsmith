@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"filippo.io/age"
@@ -541,6 +542,73 @@ func TestResolve_EncryptedSSHKey_UnlockOnce(t *testing.T) {
 	}
 	if prompter.calls != 1 {
 		t.Errorf("prompter called %d times, want exactly 1 (unlock once per run)", prompter.calls)
+	}
+}
+
+func TestDecryptFile_EncryptedSSHKey_PromptNoticeNamesSource(t *testing.T) {
+	// When a passphrase prompt fires for a discovered SSH key, DecryptFile must
+	// print a one-line notice naming the .age file that triggered it, so a
+	// repo-induced prompt is explainable (security finding #1).
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	const pass = "hunter2"
+	_, pub := writeEd25519Key(t, sshDir, "id_ed25519", []byte(pass))
+
+	var notice bytes.Buffer
+	prev := promptNoticeWriter
+	promptNoticeWriter = &notice
+	t.Cleanup(func() { promptNoticeWriter = prev })
+
+	prompter := &fakePrompter{interactive: true, passphrase: []byte(pass)}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ct := encryptToRecipients(t, "secret", sshRecipient(t, pub))
+	agePath := filepath.Join(t.TempDir(), "gitconfig.age")
+	if werr := os.WriteFile(agePath, ct, 0o600); werr != nil {
+		t.Fatalf("write age file: %v", werr)
+	}
+
+	out, derr := DecryptFile(context.Background(), agePath, set)
+	if derr != nil {
+		t.Fatalf("DecryptFile: %v", derr)
+	}
+	if string(out) != "secret" {
+		t.Errorf("DecryptFile = %q, want %q", out, "secret")
+	}
+	if got := notice.String(); !strings.Contains(got, agePath) ||
+		!strings.Contains(got, filepath.Join(sshDir, "id_ed25519")) {
+		t.Errorf("notice %q should name both the source file %q and the SSH key", got, agePath)
+	}
+}
+
+func TestDecrypt_EncryptedSSHKey_StreamPromptNoticeOmitsFile(t *testing.T) {
+	// Decrypt operates on an unnamed stream, so the prompt notice must not claim a
+	// source filename (it stays silent rather than printing a stale or empty one).
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	const pass = "hunter2"
+	_, pub := writeEd25519Key(t, sshDir, "id_ed25519", []byte(pass))
+
+	var notice bytes.Buffer
+	prev := promptNoticeWriter
+	promptNoticeWriter = &notice
+	t.Cleanup(func() { promptNoticeWriter = prev })
+
+	prompter := &fakePrompter{interactive: true, passphrase: []byte(pass)}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ct := encryptToRecipients(t, "secret", sshRecipient(t, pub))
+	if _, derr := Decrypt(context.Background(), bytes.NewReader(ct), set); derr != nil {
+		t.Fatalf("Decrypt: %v", derr)
+	}
+	if notice.Len() != 0 {
+		t.Errorf("stream decrypt printed a source-naming notice %q, want none", notice.String())
 	}
 }
 

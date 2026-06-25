@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -66,6 +67,10 @@ var (
 	listDirFunc        = defaultListDir
 	readKeyFileFunc    = os.ReadFile
 	sshParsePrivateKey = ssh.ParsePrivateKey
+	// promptNoticeWriter receives the one-line notice naming the file that
+	// triggered an SSH-key passphrase prompt, so a repo-induced prompt is
+	// explainable. Injectable for testing; defaults to stderr.
+	promptNoticeWriter io.Writer = os.Stderr
 )
 
 // Resolve builds the candidate identity set from ks: the native age identity
@@ -252,7 +257,11 @@ func encryptedSSHIdentity(
 
 	// pendingErr lets the passphrase callback surface a no-TTY hard error through
 	// agessh, which only propagates errors returned by the callback itself.
+	// currentSource names the .age file currently being decrypted (set per
+	// decrypt call via setDecryptSource); the callback reads it to attribute the
+	// prompt to the file that triggered it.
 	var pendingErr error
+	var currentSource string
 	inner, err := agessh.NewEncryptedSSHIdentity(pub, data, func() ([]byte, error) {
 		if !prompter.Interactive() {
 			pendingErr = fmt.Errorf(
@@ -260,6 +269,10 @@ func encryptedSSHIdentity(
 					"run dotsmith interactively or use an unencrypted key", path,
 			)
 			return nil, pendingErr
+		}
+		if currentSource != "" {
+			_, _ = fmt.Fprintf(promptNoticeWriter,
+				"dotsmith: decrypting %s requires SSH key %s\n", currentSource, path)
 		}
 		pass, perr := prompter.Prompt(path)
 		if perr != nil {
@@ -276,6 +289,7 @@ func encryptedSSHIdentity(
 		inner:      inner,
 		keyLabel:   path,
 		pendingErr: &pendingErr,
+		source:     &currentSource,
 	}, typeSSHEncrypted, newSSHProbe(pub), nil
 }
 
@@ -299,6 +313,10 @@ type retryingEncryptedIdentity struct {
 	// pendingErr receives a hard error (no TTY, or prompt I/O failure) set by the
 	// passphrase callback; such errors must not be retried.
 	pendingErr *error
+	// source points at the callback's currentSource: the .age file currently
+	// being decrypted, written via setDecryptSource so the passphrase notice can
+	// name what triggered the prompt. Empty when decrypting an unnamed stream.
+	source *string
 }
 
 var _ age.Identity = (*retryingEncryptedIdentity)(nil)
@@ -429,6 +447,18 @@ func sshKindFor(id age.Identity) identityType {
 func (s *IdentitySet) add(id age.Identity, path string, kind identityType, probe prober) {
 	s.identities = append(s.identities, id)
 	s.candidates = append(s.candidates, candidate{identity: id, path: path, kind: kind, probe: probe})
+}
+
+// setDecryptSource records the file about to be decrypted so a passphrase prompt
+// for a discovered, passphrase-protected SSH key can name what triggered it.
+// Pass "" for an unnamed stream. It is a no-op for candidates that are not
+// passphrase-protected SSH keys.
+func (s IdentitySet) setDecryptSource(path string) {
+	for _, c := range s.candidates {
+		if r, ok := c.identity.(*retryingEncryptedIdentity); ok && r.source != nil {
+			*r.source = path
+		}
+	}
 }
 
 // logSkip records a discovery skip under verbose mode only; skips are otherwise
