@@ -42,8 +42,18 @@ type Config struct {
 	TargetDir string
 	// Identity is the resolved identity used for override layer selection.
 	Identity identity.Identity
-	// AgeIdentity is the path to the age identity file for encryption.
+	// AgeIdentity is the path to the native age identity file for decryption.
 	AgeIdentity string
+	// AgeIdentityExplicit is true when AgeIdentity was set by the user (config or
+	// flag) rather than left at its default. A missing default key is tolerated;
+	// a missing explicit key is a hard error.
+	AgeIdentityExplicit bool
+	// AgeIdentities holds extra identity paths (native age or SSH), each
+	// format-auto-detected. Every entry is treated as explicit.
+	AgeIdentities []string
+	// AgeSSHDiscovery toggles scanning ~/.ssh/ for usable SSH private keys.
+	// Defaults to true.
+	AgeSSHDiscovery bool
 	// Verbose enables verbose output.
 	Verbose bool
 	// DryRun suppresses all filesystem changes.
@@ -70,14 +80,30 @@ func Load(_ context.Context, flags Flags) (Config, error) {
 		return Config{}, err
 	}
 
+	// AgeIdentity is explicit when set by the --age-identity flag or by the user
+	// in config; the un-overridden default is tolerated if absent. Viper's IsSet
+	// reports a config-provided key only because age.identity_file has no Viper
+	// default.
+	ageIdentityExplicit := flags.AgeIdentity != "" || v.IsSet("age.identity_file")
+	ageIdentity := flags.AgeIdentity
+	if ageIdentity == "" {
+		ageIdentity = v.GetString("age.identity_file")
+	}
+	if ageIdentity == "" {
+		ageIdentity = defaultAgeIdentityFile
+	}
+
 	return Config{
-		DotfilesDir: coalesce(flags.DotfilesDir, expandHome(v.GetString("dotfiles_dir"))),
-		CompileDir:  coalesce(flags.CompileDir, expandHome(v.GetString("compile_dir"))),
-		TargetDir:   coalesce(flags.TargetDir, expandHome(v.GetString("target_dir"))),
-		Identity:    id,
-		AgeIdentity: coalesce(flags.AgeIdentity, expandHome(v.GetString("age.identity_file"))),
-		Verbose:     flags.Verbose || v.GetBool("verbose"),
-		DryRun:      flags.DryRun || v.GetBool("dry_run"),
+		DotfilesDir:         coalesce(flags.DotfilesDir, expandHome(v.GetString("dotfiles_dir"))),
+		CompileDir:          coalesce(flags.CompileDir, expandHome(v.GetString("compile_dir"))),
+		TargetDir:           coalesce(flags.TargetDir, expandHome(v.GetString("target_dir"))),
+		Identity:            id,
+		AgeIdentity:         expandHome(ageIdentity),
+		AgeIdentityExplicit: ageIdentityExplicit,
+		AgeIdentities:       expandHomeAll(v.GetStringSlice("age.identities")),
+		AgeSSHDiscovery:     v.GetBool("age.ssh_discovery"),
+		Verbose:             flags.Verbose || v.GetBool("verbose"),
+		DryRun:              flags.DryRun || v.GetBool("dry_run"),
 	}, nil
 }
 
@@ -86,8 +112,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("dotfiles_dir", "~/.dotfiles")
 	v.SetDefault("compile_dir", "~/.dotcompiled")
 	v.SetDefault("target_dir", "~")
-	v.SetDefault("age.identity_file", "~/.dotsmith-age-key")
+	// age.identity_file is deliberately left without a Viper default so IsSet can
+	// distinguish a user-configured path from the built-in default; the default is
+	// applied in Go (see defaultAgeIdentityFile).
+	v.SetDefault("age.ssh_discovery", true)
 }
+
+// defaultAgeIdentityFile is the built-in native age identity path used when the
+// user has not configured one. A missing file at this path is tolerated.
+const defaultAgeIdentityFile = "~/.dotsmith-age-key"
 
 // loadConfigFiles reads the single applicable user-level config file into v.
 // An explicit --config path takes precedence; otherwise the first existing file
@@ -171,6 +204,18 @@ func expandHome(path string) string {
 		return path
 	}
 	return filepath.Join(userHomeDir(), path[2:])
+}
+
+// expandHomeAll applies expandHome to each path in the slice.
+func expandHomeAll(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = expandHome(p)
+	}
+	return out
 }
 
 // userHomeDir returns the current user's home directory or "~" on error.

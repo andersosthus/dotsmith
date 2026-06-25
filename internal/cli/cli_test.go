@@ -3,6 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"os"
@@ -11,8 +14,10 @@ import (
 	"testing"
 
 	"filippo.io/age"
+	"filippo.io/age/agessh"
 	"filippo.io/age/armor"
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
 	"github.com/andersosthus/dotsmith/internal/config"
@@ -117,6 +122,27 @@ func writeAgeFile(t *testing.T, keyPath, plainPath, content string) string {
 	return agePath
 }
 
+// encryptArmored produces armored age ciphertext for the given recipients.
+func encryptArmored(t *testing.T, content string, recipients ...age.Recipient) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	aw := armor.NewWriter(&buf)
+	w, err := age.Encrypt(aw, recipients...)
+	if err != nil {
+		t.Fatalf("age.Encrypt: %v", err)
+	}
+	if _, err = io.WriteString(w, content); err != nil {
+		t.Fatalf("write plaintext: %v", err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatalf("close age writer: %v", err)
+	}
+	if err = aw.Close(); err != nil {
+		t.Fatalf("close armor writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // writeSubfile writes a subfile into the dotfiles dir's base layer.
 func writeSubfile(t *testing.T, dotfilesDir, name, content string) {
 	t.Helper()
@@ -211,6 +237,48 @@ func TestCompileCmd_Success(t *testing.T) {
 
 	if _, statErr := os.Stat(filepath.Join(compileDir, ".bashrc")); statErr != nil {
 		t.Errorf("expected .bashrc in compileDir, got: %v", statErr)
+	}
+}
+
+// forceResolveError makes the shared identity-set resolver fail, exercising the
+// resolve-error branch in every command that resolves identities.
+func forceResolveError(t *testing.T) {
+	t.Helper()
+	orig := resolveIdentitiesFunc
+	t.Cleanup(func() { resolveIdentitiesFunc = orig })
+	resolveIdentitiesFunc = func(_ context.Context, _ encrypt.KeySource, _ encrypt.Prompter) (encrypt.IdentitySet, error) {
+		return encrypt.IdentitySet{}, fmt.Errorf("forced resolve error")
+	}
+}
+
+func TestCompileCmd_ResolveError(t *testing.T) {
+	forceResolveError(t)
+	root := makeDotfiles(t)
+	if _, err := runWithDotfiles(t, root, "compile"); err == nil {
+		t.Fatal("expected error from resolve failure, got nil")
+	}
+}
+
+func TestApplyCmd_ResolveError(t *testing.T) {
+	forceResolveError(t)
+	root := makeDotfiles(t)
+	if _, err := runWithDotfiles(t, root, "apply"); err == nil {
+		t.Fatal("expected error from resolve failure, got nil")
+	}
+}
+
+func TestRenderCmd_ResolveError(t *testing.T) {
+	forceResolveError(t)
+	root := makeDotfiles(t)
+	if _, err := runWithDotfiles(t, root, "render", ".bashrc"); err == nil {
+		t.Fatal("expected error from resolve failure, got nil")
+	}
+}
+
+func TestDecryptCmd_ResolveError(t *testing.T) {
+	forceResolveError(t)
+	if _, err := run(t, "decrypt", "/some/file.age"); err == nil {
+		t.Fatal("expected error from resolve failure, got nil")
 	}
 }
 
@@ -445,6 +513,59 @@ func TestDecryptCmd_Success(t *testing.T) {
 	}
 }
 
+// TestDecryptCmd_SSHDiscovery exercises the headline feature: a file encrypted
+// to an SSH public key is decrypted using a matching unencrypted SSH private key
+// discovered in ~/.ssh/, with no age identity configuration.
+func TestDecryptCmd_SSHDiscovery(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	rec := writeDiscoverableSSHKey(t, home)
+
+	agePath := filepath.Join(t.TempDir(), "secret.txt.age")
+	if werr := os.WriteFile(agePath, encryptArmored(t, "ssh-decrypted\n", rec), 0o600); werr != nil {
+		t.Fatalf("write age file: %v", werr)
+	}
+
+	out, err := run(t, "decrypt", agePath)
+	if err != nil {
+		t.Fatalf("decrypt via discovered SSH key: %v", err)
+	}
+	if !strings.Contains(out, "ssh-decrypted") {
+		t.Errorf("decrypt output = %q, want 'ssh-decrypted'", out)
+	}
+}
+
+// writeDiscoverableSSHKey writes an unencrypted ed25519 private key into
+// home/.ssh and returns an age recipient for its public half.
+func writeDiscoverableSSHKey(t *testing.T, home string) age.Recipient {
+	t.Helper()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll .ssh: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519 GenerateKey: %v", err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "test")
+	if err != nil {
+		t.Fatalf("MarshalPrivateKey: %v", err)
+	}
+	if werr := os.WriteFile(filepath.Join(sshDir, "id_ed25519"), pem.EncodeToMemory(block), 0o600); werr != nil {
+		t.Fatalf("write key: %v", werr)
+	}
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatalf("ssh.NewPublicKey: %v", err)
+	}
+	rec, err := agessh.NewEd25519Recipient(sshPub)
+	if err != nil {
+		t.Fatalf("NewEd25519Recipient: %v", err)
+	}
+	return rec
+}
+
 func TestDecryptCmd_NotAge(t *testing.T) {
 	_, err := run(t, "decrypt", "/some/file.txt")
 	if err == nil {
@@ -463,7 +584,7 @@ func TestDecryptCmd_DecryptError(t *testing.T) {
 	keyPath := generateAgeKey(t)
 	orig := decryptFileFunc
 	t.Cleanup(func() { decryptFileFunc = orig })
-	decryptFileFunc = func(_ context.Context, _ string, _ encrypt.KeySource) ([]byte, error) {
+	decryptFileFunc = func(_ context.Context, _ string, _ encrypt.IdentitySet) ([]byte, error) {
 		return nil, fmt.Errorf("forced decrypt error")
 	}
 

@@ -16,8 +16,9 @@ import (
 	"github.com/andersosthus/dotsmith/internal/identity"
 )
 
-// generateKey creates a new age identity and writes it to a temp file.
-func generateKey(t *testing.T) (keyPath string, ks encrypt.KeySource) {
+// generateKey creates a new age identity, writes it to a temp file, and resolves
+// it into a candidate identity set for the compiler to consume.
+func generateKey(t *testing.T) (keyPath string, set encrypt.IdentitySet) {
 	t.Helper()
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
@@ -28,16 +29,22 @@ func generateKey(t *testing.T) (keyPath string, ks encrypt.KeySource) {
 	if err = os.WriteFile(keyPath, []byte(id.String()+"\n"), 0o600); err != nil {
 		t.Fatalf("write key: %v", err)
 	}
-	ks = encrypt.KeySource{IdentityFile: keyPath}
-	return keyPath, ks
+	set, err = encrypt.Resolve(context.Background(), encrypt.KeySource{
+		IdentityFile:         keyPath,
+		IdentityFileExplicit: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	return keyPath, set
 }
 
-// encryptFile encrypts plaintext to <path>.age for the recipient in ks. The
+// encryptFile encrypts plaintext to <path>.age for the recipient in keyPath. The
 // encrypt code path was removed from the encrypt package, so tests build the
 // armored age ciphertext directly.
-func encryptFile(t *testing.T, path string, plaintext string, ks encrypt.KeySource) {
+func encryptFile(t *testing.T, path string, plaintext string, keyPath string) {
 	t.Helper()
-	keyData, err := os.ReadFile(ks.IdentityFile)
+	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
 		t.Fatalf("ReadFile key: %v", err)
 	}
@@ -181,15 +188,15 @@ func TestCompile_RegularFile_NoHeader(t *testing.T) {
 }
 
 func TestCompile_EncryptedSubfile(t *testing.T) {
-	_, ks := generateKey(t)
+	keyPath, set := generateKey(t)
 
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
 	// Create the plain file and encrypt it.
-	encryptFile(t, filepath.Join(base, ".subfile-040.bashrc"), "export SECRET=hi\n", ks)
+	encryptFile(t, filepath.Join(base, ".subfile-040.bashrc"), "export SECRET=hi\n", keyPath)
 
 	ctx := context.Background()
-	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks}
+	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, Identities: set}
 	result, err := Compile(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Compile with encrypted subfile: %v", err)
@@ -212,22 +219,22 @@ func TestCompile_DuplicateSubfileError(t *testing.T) {
 			{Number: "010", SourcePath: "/fake2"},
 		},
 	}
-	_, err := compileSubfiles(context.Background(), entry, encrypt.KeySource{})
+	_, _, err := compileSubfiles(context.Background(), entry, CompileConfig{Identities: encrypt.IdentitySet{}})
 	if err == nil {
 		t.Fatal("expected error for duplicate subfile numbers, got nil")
 	}
 }
 
 func TestCompile_DecryptionFailure(t *testing.T) {
-	_, ks1 := generateKey(t)
-	_, ks2 := generateKey(t)
+	keyPath1, _ := generateKey(t)
+	_, set2 := generateKey(t)
 
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
-	encryptFile(t, filepath.Join(base, ".subfile-010.bashrc"), "secret\n", ks1)
+	encryptFile(t, filepath.Join(base, ".subfile-010.bashrc"), "secret\n", keyPath1)
 
 	ctx := context.Background()
-	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks2}
+	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, Identities: set2}
 	_, err := Compile(ctx, cfg)
 	if err == nil {
 		t.Fatal("expected error decrypting with wrong key, got nil")
@@ -286,15 +293,15 @@ func TestWriteCompiled_IdempotentSameContent(t *testing.T) {
 }
 
 func TestWriteCompiled_Permissions(t *testing.T) {
-	_, ks := generateKey(t)
+	keyPath, set := generateKey(t)
 
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
 	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "export A=1\n")
-	encryptFile(t, filepath.Join(base, ".subfile-001.secret"), "secret\n", ks)
+	encryptFile(t, filepath.Join(base, ".subfile-001.secret"), "secret\n", keyPath)
 
 	ctx := context.Background()
-	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks}
+	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, Identities: set}
 	compileDir := t.TempDir()
 	// Set compileDir permissions.
 	if err := os.Chmod(compileDir, 0o700); err != nil {
@@ -405,14 +412,14 @@ func TestWriteCompiled_MkdirError(t *testing.T) {
 }
 
 func TestCompile_EncryptedRegularFile(t *testing.T) {
-	_, ks := generateKey(t)
+	keyPath, set := generateKey(t)
 
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
-	encryptFile(t, filepath.Join(base, ".secret"), "top secret\n", ks)
+	encryptFile(t, filepath.Join(base, ".secret"), "top secret\n", keyPath)
 
 	ctx := context.Background()
-	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks}
+	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, Identities: set}
 	result, err := Compile(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -445,15 +452,15 @@ func TestCompile_RegularReadError(t *testing.T) {
 }
 
 func TestCompile_EncryptedRegularDecryptError(t *testing.T) {
-	_, ks1 := generateKey(t)
-	_, ks2 := generateKey(t)
+	keyPath1, _ := generateKey(t)
+	_, set2 := generateKey(t)
 
 	root := t.TempDir()
 	base := makeDir(t, root, "base")
-	encryptFile(t, filepath.Join(base, ".secret"), "data\n", ks1)
+	encryptFile(t, filepath.Join(base, ".secret"), "data\n", keyPath1)
 
 	ctx := context.Background()
-	_, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, KeySource: ks2})
+	_, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}, Identities: set2})
 	if err == nil {
 		t.Fatal("expected error decrypting regular file with wrong key, got nil")
 	}
@@ -462,7 +469,7 @@ func TestCompile_EncryptedRegularDecryptError(t *testing.T) {
 func TestCompile_EmptyRegularEntry(t *testing.T) {
 	// Edge case: a FileEntry with IsRegular=true but no subfiles.
 	entry := &FileEntry{Target: "empty", IsRegular: true, Subfiles: nil}
-	_, err := compileRegular(context.Background(), entry, encrypt.KeySource{})
+	_, _, err := compileRegular(context.Background(), entry, CompileConfig{Identities: encrypt.IdentitySet{}})
 	if err == nil {
 		t.Fatal("expected error for empty regular entry, got nil")
 	}

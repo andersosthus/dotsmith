@@ -6,7 +6,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
-	"github.com/andersosthus/dotsmith/internal/encrypt"
 )
 
 func newRenderCmd() *cobra.Command {
@@ -18,10 +17,15 @@ func newRenderCmd() *cobra.Command {
 			cfg := mustGetCfg(cmd)
 			relPath := args[0]
 
+			set, err := resolveIdentitySet(cmd.Context(), cfg)
+			if err != nil {
+				return fmt.Errorf("render: %w", err)
+			}
+
 			result, err := compileFunc(cmd.Context(), compiler.CompileConfig{
 				DotfilesDir: cfg.DotfilesDir,
 				Identity:    cfg.Identity,
-				KeySource:   encrypt.KeySource{IdentityFile: cfg.AgeIdentity},
+				Identities:  set,
 			})
 			if err != nil {
 				return fmt.Errorf("render: %w", err)

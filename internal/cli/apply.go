@@ -6,7 +6,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
-	"github.com/andersosthus/dotsmith/internal/encrypt"
 	"github.com/andersosthus/dotsmith/internal/linker"
 )
 
@@ -18,15 +17,23 @@ func newApplyCmd() *cobra.Command {
 			cfg := mustGetCfg(cmd)
 			ctx := cmd.Context()
 
+			set, err := resolveIdentitySet(ctx, cfg)
+			if err != nil {
+				return fmt.Errorf("apply: %w", err)
+			}
+
 			compileCfg := compiler.CompileConfig{
 				DotfilesDir: cfg.DotfilesDir,
 				Identity:    cfg.Identity,
-				KeySource:   encrypt.KeySource{IdentityFile: cfg.AgeIdentity},
+				Identities:  set,
+				DryRun:      cfg.DryRun,
 			}
 			result, err := compileFunc(ctx, compileCfg)
 			if err != nil {
 				return fmt.Errorf("apply: compile: %w", err)
 			}
+
+			printDryRunReports(cmd.OutOrStdout(), result.DryRunReports)
 
 			writeCfg := compiler.WriteConfig{
 				CompileDir: cfg.CompileDir,
