@@ -110,15 +110,23 @@ func installHook(hooksDir, name, branch string, cmd *cobra.Command) error {
 
 // hookBlockForBranch returns the hook block to insert. When branch is empty, the plain
 // unconditional block is returned. When branch is set, the apply command is wrapped in a
-// branch guard that checks git branch --show-current.
+// branch guard that checks git branch --show-current. The branch value is shell-quoted so
+// that names containing quotes or shell metacharacters produce a valid hook.
 func hookBlockForBranch(branch string) string {
 	if branch == "" {
 		return hookBlock
 	}
-	body := "if [ \"$(git branch --show-current)\" = \"" + branch + "\" ]; then\n" +
+	body := "if [ \"$(git branch --show-current)\" = " + shellQuote(branch) + " ]; then\n" +
 		"  " + hookBody + "\n" +
 		"fi"
 	return hookBegin + "\n" + body + "\n" + hookEnd + "\n"
+}
+
+// shellQuote wraps s in single quotes for safe inclusion in a POSIX shell script. Any
+// embedded single quote is escaped using the standard '\'' sequence, so the result is a
+// single shell word regardless of the characters in s.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func removeHook(hooksDir, name string, cmd *cobra.Command) error {

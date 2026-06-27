@@ -1037,7 +1037,7 @@ func TestGitInstallCmd_Branch(t *testing.T) {
 	if !strings.Contains(content, "git branch --show-current") {
 		t.Errorf("hook content = %q, want 'git branch --show-current'", content)
 	}
-	if !strings.Contains(content, `= "main"`) {
+	if !strings.Contains(content, `= 'main'`) {
 		t.Errorf("hook content = %q, want branch guard for 'main'", content)
 	}
 	if !strings.Contains(content, "dotsmith apply") {
@@ -1299,6 +1299,52 @@ func TestCompiledFileRefs_SkipsStateFile(t *testing.T) {
 	}
 	if len(refs) != 1 || refs[0].RelPath != ".bashrc" {
 		t.Errorf("refs = %v, want [{.bashrc ...}]", refs)
+	}
+}
+
+// ---- shellQuote / hookBlockForBranch ---------------------------------------
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain", in: "main", want: `'main'`},
+		{name: "empty", in: "", want: `''`},
+		{name: "double quote", in: `fea"ture`, want: `'fea"ture'`},
+		{name: "single quote", in: "fea'ture", want: `'fea'\''ture'`},
+		{name: "metacharacters", in: "a; rm -rf /", want: `'a; rm -rf /'`},
+		{name: "subshell", in: "$(touch x)", want: `'$(touch x)'`},
+		{name: "backtick", in: "`id`", want: "'`id`'"},
+		{name: "only single quote", in: "'", want: `''\'''`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shellQuote(tt.in); got != tt.want {
+				t.Errorf("shellQuote(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHookBlockForBranch_Quoting(t *testing.T) {
+	// A branch name containing a double quote must not break out of the test
+	// expression; the value is single-quoted.
+	block := hookBlockForBranch(`fea"ture`)
+	if !strings.Contains(block, `= 'fea"ture' ]`) {
+		t.Errorf("hook block = %q, want single-quoted branch guard", block)
+	}
+	// An embedded single quote is escaped via the '\'' sequence.
+	block = hookBlockForBranch("o'brien")
+	if !strings.Contains(block, `= 'o'\''brien' ]`) {
+		t.Errorf("hook block = %q, want escaped single quote", block)
+	}
+}
+
+func TestHookBlockForBranch_Empty(t *testing.T) {
+	if got := hookBlockForBranch(""); got != hookBlock {
+		t.Errorf("hookBlockForBranch(\"\") = %q, want plain hookBlock %q", got, hookBlock)
 	}
 }
 

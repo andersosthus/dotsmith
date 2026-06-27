@@ -419,7 +419,7 @@ This wraps the apply call in a branch guard:
 
 ```sh
 # --- dotsmith hook begin ---
-if [ "$(git branch --show-current)" = "main" ]; then
+if [ "$(git branch --show-current)" = 'main' ]; then
   dotsmith apply --verbose || true
 fi
 # --- dotsmith hook end ---
