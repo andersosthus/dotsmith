@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/andersosthus/dotsmith/internal/identity"
@@ -503,6 +504,47 @@ func TestDiscover_RelPathError(t *testing.T) {
 	_, err := Discover(ctx, root, baseOnly)
 	if err == nil {
 		t.Fatal("expected error from filepathRelFunc, got nil")
+	}
+}
+
+func TestDiscover_ReservedStateFileRejected(t *testing.T) {
+	tests := []struct {
+		name  string
+		layer string // "base" or a subdir under an override layer
+		file  string
+	}{
+		{name: "regular in base", layer: "base", file: ".dotsmith.state"},
+		{name: "encrypted in base", layer: "base", file: ".dotsmith.state.age"},
+		{name: "subfile in base", layer: "base", file: ".dotsmith.subfile-001.state"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := stubDotfiles(t)
+			base := filepath.Join(root, "base")
+			writeFile(t, base, tc.file, "not json")
+
+			ctx := context.Background()
+			_, err := Discover(ctx, root, baseOnly)
+			if err == nil {
+				t.Fatalf("Discover: expected error for reserved file %q, got nil", tc.file)
+			}
+			if !strings.Contains(err.Error(), ".dotsmith.state") {
+				t.Errorf("error %q does not mention reserved filename", err.Error())
+			}
+		})
+	}
+}
+
+func TestDiscover_ReservedStateFileInOverrideLayer(t *testing.T) {
+	root := stubDotfiles(t)
+	osDir := makeDir(t, root, "os", "linux")
+	writeFile(t, osDir, ".dotsmith.state", "not json")
+
+	ctx := context.Background()
+	_, err := Discover(ctx, root, identity.Identity{OS: "linux"})
+	if err == nil {
+		t.Fatal("Discover: expected error for reserved file in override layer, got nil")
 	}
 }
 

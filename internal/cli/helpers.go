@@ -14,6 +14,7 @@ import (
 	"github.com/andersosthus/dotsmith/internal/config"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
 	"github.com/andersosthus/dotsmith/internal/linker"
+	"github.com/andersosthus/dotsmith/internal/state"
 )
 
 // Injectable for testing.
@@ -74,7 +75,7 @@ func compiledFileRefs(compileDir string) ([]linker.FileRef, error) {
 			return relErr
 		}
 		// Skip the state file.
-		if rel == ".dotsmith.state" {
+		if rel == state.FileName {
 			return nil
 		}
 		data, readErr := os.ReadFile(path)

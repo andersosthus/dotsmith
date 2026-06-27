@@ -11,7 +11,13 @@ import (
 	"path/filepath"
 )
 
-const stateFile = ".dotsmith.state"
+// FileName is the reserved basename of the dotsmith state file, stored inside
+// the compile directory. It must never be produced as a managed dotfile, or it
+// would clobber dotsmith's own bookkeeping.
+const FileName = ".dotsmith.state"
+
+// stateFile is the legacy internal alias for FileName.
+const stateFile = FileName
 
 // SymlinkEntry records a managed symlink and the content hash of its source
 // file at the time it was linked.
