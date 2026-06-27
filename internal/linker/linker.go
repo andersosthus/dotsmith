@@ -117,8 +117,25 @@ func Link(ctx context.Context, cfg LinkConfig, files []FileRef) (*LinkResult, er
 	return result, nil
 }
 
+// safeJoin joins base and rel and confirms the result stays within base. It is
+// the belt-and-suspenders guard for every deletion sink: state.Load already
+// rejects non-local Source/Target paths, but any future producer of state
+// entries that bypasses Load must not be able to escape base and delete
+// arbitrary files. rel must be a local path (no leading "/" or ".." escape).
+func safeJoin(base, rel string) (string, error) {
+	if !filepath.IsLocal(rel) {
+		return "", fmt.Errorf(
+			"refusing non-local path %q under %s — entry escapes its directory",
+			rel, base,
+		)
+	}
+	return filepath.Join(base, rel), nil
+}
+
 // removeOrphans removes symlinks, compiled files, and state entries for paths
-// present in state but absent from currentFiles.
+// present in state but absent from currentFiles. The Source/Target paths are
+// re-validated as local before each os.Remove so a state entry that bypassed
+// state.Load's containment check cannot delete files outside TargetDir/CompileDir.
 func removeOrphans(
 	cfg LinkConfig,
 	s *state.State,
@@ -133,17 +150,32 @@ func removeOrphans(
 			r.Removed++
 			continue
 		}
-		targetPath := filepath.Join(cfg.TargetDir, entry.Target)
-		if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove orphan symlink %s: %w", targetPath, err)
-		}
-		removeEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
-		sourcePath := filepath.Join(cfg.CompileDir, entry.Source)
-		if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove orphan compiled %s: %w", sourcePath, err)
+		if err := removeOrphanEntry(cfg, entry); err != nil {
+			return err
 		}
 		delete(s.Symlinks, relPath)
 		r.Removed++
+	}
+	return nil
+}
+
+// removeOrphanEntry deletes the symlink and compiled source file for a single
+// orphaned state entry. Both paths are re-validated as local before os.Remove.
+func removeOrphanEntry(cfg LinkConfig, entry state.SymlinkEntry) error {
+	targetPath, err := safeJoin(cfg.TargetDir, entry.Target)
+	if err != nil {
+		return fmt.Errorf("remove orphan symlink: %w", err)
+	}
+	sourcePath, err := safeJoin(cfg.CompileDir, entry.Source)
+	if err != nil {
+		return fmt.Errorf("remove orphan compiled: %w", err)
+	}
+	if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove orphan symlink %s: %w", targetPath, err)
+	}
+	removeEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
+	if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove orphan compiled %s: %w", sourcePath, err)
 	}
 	return nil
 }
@@ -298,11 +330,20 @@ func Clean(ctx context.Context, cfg LinkConfig) error {
 	return nil
 }
 
-// cleanSymlinks removes each managed symlink and its compiled source file.
+// cleanSymlinks removes each managed symlink and its compiled source file. The
+// Source/Target paths are re-validated as local before each os.Remove so a state
+// entry that bypassed state.Load's containment check cannot delete files outside
+// TargetDir/CompileDir.
 func cleanSymlinks(cfg LinkConfig, s *state.State) error {
 	for _, entry := range s.Symlinks {
-		targetPath := filepath.Join(cfg.TargetDir, entry.Target)
-		sourcePath := filepath.Join(cfg.CompileDir, entry.Source)
+		targetPath, err := safeJoin(cfg.TargetDir, entry.Target)
+		if err != nil {
+			return fmt.Errorf("clean: remove symlink: %w", err)
+		}
+		sourcePath, err := safeJoin(cfg.CompileDir, entry.Source)
+		if err != nil {
+			return fmt.Errorf("clean: remove compiled: %w", err)
+		}
 
 		if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("clean: remove symlink %s: %w", targetPath, err)
