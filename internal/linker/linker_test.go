@@ -942,6 +942,160 @@ func TestClean_RemoveSourceError(t *testing.T) {
 	}
 }
 
+// ---- containment guard tests ------------------------------------------------
+
+// TestSafeJoin verifies safeJoin accepts local paths and refuses non-local ones.
+func TestSafeJoin(t *testing.T) {
+	base := t.TempDir()
+	tests := []struct {
+		name    string
+		rel     string
+		wantErr bool
+	}{
+		{name: "simple local", rel: ".bashrc", wantErr: false},
+		{name: "nested local", rel: filepath.Join("a", "b", "c"), wantErr: false},
+		{name: "parent escape", rel: filepath.Join("..", "evil"), wantErr: true},
+		{name: "deep parent escape", rel: filepath.Join("a", "..", "..", "evil"), wantErr: true},
+		{name: "absolute path", rel: "/etc/passwd", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := safeJoin(base, tt.rel)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("safeJoin(%q, %q) = %q, want error", base, tt.rel, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("safeJoin(%q, %q) unexpected error: %v", base, tt.rel, err)
+			}
+			if got != filepath.Join(base, tt.rel) {
+				t.Errorf("safeJoin = %q, want %q", got, filepath.Join(base, tt.rel))
+			}
+		})
+	}
+}
+
+// nonLocalState builds a State whose single entry escapes its directory. It
+// bypasses state.Load (which would reject such an entry) to simulate a future
+// producer that populates State without going through Load.
+func nonLocalState(rel string) *state.State {
+	s := state.New()
+	s.Symlinks["evil"] = state.SymlinkEntry{Source: rel, Target: rel, ContentHash: "h"}
+	return s
+}
+
+// TestRemoveOrphans_NonLocalTargetRefused verifies removeOrphans refuses a
+// non-local Target and performs no out-of-tree deletion.
+func TestRemoveOrphans_NonLocalTarget_Refused(t *testing.T) {
+	targetDir := t.TempDir()
+	compileDir := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+
+	// Relative path from targetDir back out to the victim file.
+	rel, err := filepath.Rel(targetDir, victim)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	s := nonLocalState(rel)
+
+	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
+	err = removeOrphans(cfg, s, map[string]struct{}{}, &LinkResult{})
+	if err == nil {
+		t.Fatal("expected removeOrphans to refuse non-local target, got nil")
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("victim file was deleted or unreadable: %v", statErr)
+	}
+}
+
+// TestRemoveOrphans_NonLocalSource_Refused verifies removeOrphans refuses a
+// non-local Source and performs no out-of-tree deletion.
+func TestRemoveOrphans_NonLocalSource_Refused(t *testing.T) {
+	targetDir := t.TempDir()
+	compileDir := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+
+	rel, err := filepath.Rel(compileDir, victim)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	// Local Target so the check that fails is the Source check.
+	s := state.New()
+	s.Symlinks["evil"] = state.SymlinkEntry{Source: rel, Target: ".bashrc", ContentHash: "h"}
+
+	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
+	err = removeOrphans(cfg, s, map[string]struct{}{}, &LinkResult{})
+	if err == nil {
+		t.Fatal("expected removeOrphans to refuse non-local source, got nil")
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("victim file was deleted or unreadable: %v", statErr)
+	}
+}
+
+// TestCleanSymlinks_NonLocalTarget_Refused verifies cleanSymlinks refuses a
+// non-local Target and performs no out-of-tree deletion.
+func TestCleanSymlinks_NonLocalTarget_Refused(t *testing.T) {
+	targetDir := t.TempDir()
+	compileDir := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+
+	rel, err := filepath.Rel(targetDir, victim)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	s := nonLocalState(rel)
+
+	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
+	if err := cleanSymlinks(cfg, s); err == nil {
+		t.Fatal("expected cleanSymlinks to refuse non-local target, got nil")
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("victim file was deleted or unreadable: %v", statErr)
+	}
+}
+
+// TestCleanSymlinks_NonLocalSource_Refused verifies cleanSymlinks refuses a
+// non-local Source and performs no out-of-tree deletion.
+func TestCleanSymlinks_NonLocalSource_Refused(t *testing.T) {
+	targetDir := t.TempDir()
+	compileDir := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+
+	rel, err := filepath.Rel(compileDir, victim)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	s := state.New()
+	s.Symlinks["evil"] = state.SymlinkEntry{Source: rel, Target: ".bashrc", ContentHash: "h"}
+
+	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
+	if err := cleanSymlinks(cfg, s); err == nil {
+		t.Fatal("expected cleanSymlinks to refuse non-local source, got nil")
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("victim file was deleted or unreadable: %v", statErr)
+	}
+}
+
 // ---- hashBytes test ---------------------------------------------------------
 
 func TestHashBytes_Deterministic(t *testing.T) {
