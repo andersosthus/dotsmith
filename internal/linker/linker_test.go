@@ -976,3 +976,69 @@ func TestStateJSON_RoundTrip(t *testing.T) {
 		t.Errorf("round-trip = %+v, want {src tgt abc}", got)
 	}
 }
+
+// ---- removeEmptyParents -----------------------------------------------------
+
+// TestRemoveEmptyParents verifies the climb-up stops at stopAt regardless of
+// non-canonical formatting (e.g. a trailing slash) on either path.
+func TestRemoveEmptyParents(t *testing.T) {
+	tests := []struct {
+		name string
+		// stopAtSuffix is appended to the cleaned stop directory to simulate
+		// non-canonical caller formatting (e.g. a trailing slash).
+		stopAtSuffix string
+		// dirSuffix is appended to the cleaned start directory.
+		dirSuffix string
+	}{
+		{name: "canonical stopAt", stopAtSuffix: "", dirSuffix: ""},
+		{name: "stopAt trailing slash", stopAtSuffix: "/", dirSuffix: ""},
+		{name: "dir trailing slash", stopAtSuffix: "", dirSuffix: "/"},
+		{name: "both trailing slash", stopAtSuffix: "/", dirSuffix: "/"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			// Layout: <root>/a/b/c — all empty below the stop point.
+			deep := filepath.Join(root, "a", "b", "c")
+			if err := os.MkdirAll(deep, 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+
+			removeEmptyParents(deep+tc.dirSuffix, root+tc.stopAtSuffix)
+
+			// The empty descendants of root must be gone.
+			if _, err := os.Stat(filepath.Join(root, "a")); !os.IsNotExist(err) {
+				t.Errorf("expected %s removed, stat err = %v", filepath.Join(root, "a"), err)
+			}
+			// stopAt itself (root) must survive.
+			if _, err := os.Stat(root); err != nil {
+				t.Errorf("expected stopAt %s to survive, stat err = %v", root, err)
+			}
+		})
+	}
+}
+
+// TestRemoveEmptyParents_StopsAtNonEmpty verifies the climb halts at the first
+// non-empty directory and leaves it (and the stop point) intact.
+func TestRemoveEmptyParents_StopsAtNonEmpty(t *testing.T) {
+	root := t.TempDir()
+	mid := filepath.Join(root, "a")
+	deep := filepath.Join(mid, "b")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// Sibling file makes mid non-empty.
+	if err := os.WriteFile(filepath.Join(mid, "keep.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	removeEmptyParents(deep, root)
+
+	if _, err := os.Stat(deep); !os.IsNotExist(err) {
+		t.Errorf("expected %s removed, stat err = %v", deep, err)
+	}
+	if _, err := os.Stat(mid); err != nil {
+		t.Errorf("expected non-empty %s to survive, stat err = %v", mid, err)
+	}
+}
