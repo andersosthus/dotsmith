@@ -316,8 +316,12 @@ func cleanSymlinks(cfg LinkConfig, s *state.State) error {
 }
 
 // removeEmptyParents removes dir and its ancestors up to (but not including)
-// stopAt, stopping at the first non-empty directory.
+// stopAt, stopping at the first non-empty directory. Both dir and stopAt are
+// cleaned before comparison so the stop point is honoured regardless of
+// trailing slashes or other non-canonical formatting in the caller's paths.
 func removeEmptyParents(dir, stopAt string) {
+	dir = filepath.Clean(dir)
+	stopAt = filepath.Clean(stopAt)
 	for dir != stopAt && dir != filepath.Dir(dir) {
 		if err := os.Remove(dir); err != nil {
 			return
