@@ -181,17 +181,47 @@ func resolveIdentity(v *viper.Viper) (identity.Identity, error) {
 		return identity.Identity{}, fmt.Errorf("resolve identity: %w", err)
 	}
 
-	// Config overrides take precedence over auto-detected values.
+	// Config overrides take precedence over auto-detected values. Each override
+	// becomes a path component when building override-layer directories
+	// (see compiler.Discover), so reject values that could escape the dotfiles
+	// directory. This is defense-in-depth: overrides come only from trusted user
+	// config, never an untrusted repo, but enforcing the "layer dirs live inside
+	// the repo" invariant here guards against self-inflicted misconfiguration.
 	if h := v.GetString("identity.hostname"); h != "" {
+		if err := validateIdentityValue("identity.hostname", h); err != nil {
+			return identity.Identity{}, err
+		}
 		detected.Hostname = h
 	}
 	if u := v.GetString("identity.username"); u != "" {
+		if err := validateIdentityValue("identity.username", u); err != nil {
+			return identity.Identity{}, err
+		}
 		detected.Username = u
 	}
 	if o := v.GetString("identity.os"); o != "" {
+		if err := validateIdentityValue("identity.os", o); err != nil {
+			return identity.Identity{}, err
+		}
 		detected.OS = o
 	}
 	return detected, nil
+}
+
+// validateIdentityValue rejects identity-override values that would escape the
+// dotfiles directory when used as an override-layer path component. A value
+// containing a path separator ('/' or '\') or equal to ".." is rejected, since
+// either could make the resolved layer directory point outside the repository.
+func validateIdentityValue(key, value string) error {
+	if value == ".." ||
+		strings.ContainsRune(value, '/') ||
+		strings.ContainsRune(value, '\\') {
+		return fmt.Errorf(
+			"resolve identity: %s value %q contains a path separator or %q — "+
+				"identity overrides are used as directory names and must be a single path component",
+			key, value, "..")
+	}
+	return nil
 }
 
 // expandHome replaces a leading ~ with the user's home directory.

@@ -233,6 +233,12 @@ identity:
   os: linux
 ```
 
+Each identity value becomes a directory name under the matching override layer
+(e.g. `os/linux`, `hostname/workstation`), so it must be a single path
+component. A value that contains a path separator (`/` or `\`) or equals `..`
+is rejected with an error rather than silently resolving a layer directory
+outside the dotfiles repository.
+
 ## Configuration
 
 Configuration is a **user-level** concern and is read only from the locations below — never from

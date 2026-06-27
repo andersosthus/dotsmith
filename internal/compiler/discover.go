@@ -56,6 +56,15 @@ func Discover(ctx context.Context, dotfilesDir string, id identity.Identity) (ma
 			layerLabel = "base"
 		}
 
+		// Defense-in-depth: layer directories must live inside the dotfiles
+		// repository. filepath.Join collapses any "../" in the layer key, so a
+		// crafted identity override could otherwise resolve layerDir outside
+		// dotfilesDir. Identity overrides come only from trusted user config, but
+		// enforce the invariant here so misconfiguration cannot escape the repo.
+		if err := assertWithinDotfilesDir(dotfilesDir, layerDir, layerLabel); err != nil {
+			return nil, err
+		}
+
 		if err := applyLayer(ctx, entries, layerDir, layerLabel); err != nil {
 			return nil, fmt.Errorf("discover: apply layer %s: %w", layerLabel, err)
 		}
@@ -67,6 +76,26 @@ func Discover(ctx context.Context, dotfilesDir string, id identity.Identity) (ma
 	}
 
 	return entries, nil
+}
+
+// assertWithinDotfilesDir verifies that layerDir resolves inside dotfilesDir.
+// It returns an error if the relative path from dotfilesDir to layerDir begins
+// with "..", which would mean the override-layer directory escaped the
+// repository (e.g. via an identity override containing "../").
+func assertWithinDotfilesDir(dotfilesDir, layerDir, layerLabel string) error {
+	rel, err := filepathRelFunc(dotfilesDir, layerDir)
+	if err != nil {
+		return fmt.Errorf(
+			"discover: resolve layer %s directory %q relative to %q: %w",
+			layerLabel, layerDir, dotfilesDir, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf(
+			"discover: layer %s resolves to %q, outside the dotfiles directory %q — "+
+				"remove the path separator or %q from the identity override",
+			layerLabel, layerDir, dotfilesDir, "..")
+	}
+	return nil
 }
 
 // applyLayer walks layerDir and applies its files to the entries map.

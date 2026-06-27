@@ -496,7 +496,13 @@ func TestDiscover_RelPathError(t *testing.T) {
 
 	orig := filepathRelFunc
 	t.Cleanup(func() { filepathRelFunc = orig })
-	filepathRelFunc = func(_, _ string) (string, error) {
+	// Force an error only for the in-walk relative-path computation (basebase ==
+	// layerDir), letting the containment check (basebase == dotfilesDir) succeed
+	// so applyLayer's walk error path is the one exercised here.
+	filepathRelFunc = func(basebase, targpath string) (string, error) {
+		if basebase == root {
+			return orig(basebase, targpath)
+		}
 		return "", fmt.Errorf("forced error")
 	}
 
@@ -545,6 +551,52 @@ func TestDiscover_ReservedStateFileInOverrideLayer(t *testing.T) {
 	_, err := Discover(ctx, root, identity.Identity{OS: "linux"})
 	if err == nil {
 		t.Fatal("Discover: expected error for reserved file in override layer, got nil")
+	}
+}
+
+func TestDiscover_LayerDirEscapesDotfilesDir(t *testing.T) {
+	// An identity override containing "../" would, after filepath.Join cleans it,
+	// resolve the layer directory outside the dotfiles dir. Discover must reject
+	// this rather than walk the escaped directory.
+	root := stubDotfiles(t)
+
+	tests := []struct {
+		name string
+		id   identity.Identity
+	}{
+		{name: "os escapes", id: identity.Identity{OS: "../../etc"}},
+		{name: "hostname escapes", id: identity.Identity{Hostname: "../../etc"}},
+		{name: "username escapes", id: identity.Identity{Username: "../../etc"}},
+		{name: "userhost escapes", id: identity.Identity{Username: "u", Hostname: "../../../etc"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, err := Discover(ctx, root, tc.id)
+			if err == nil {
+				t.Fatalf("Discover: expected error for escaping identity %+v, got nil", tc.id)
+			}
+			if !strings.Contains(err.Error(), "outside the dotfiles directory") {
+				t.Errorf("error %q does not mention containment violation", err.Error())
+			}
+		})
+	}
+}
+
+func TestAssertWithinDotfilesDir_RelError(t *testing.T) {
+	orig := filepathRelFunc
+	t.Cleanup(func() { filepathRelFunc = orig })
+	filepathRelFunc = func(_, _ string) (string, error) {
+		return "", fmt.Errorf("forced error")
+	}
+
+	err := assertWithinDotfilesDir("/dotfiles", "/dotfiles/os/linux", "os/linux")
+	if err == nil {
+		t.Fatal("expected error from filepathRelFunc, got nil")
+	}
+	if !strings.Contains(err.Error(), "forced error") {
+		t.Errorf("error %q does not wrap underlying rel error", err.Error())
 	}
 }
 

@@ -157,6 +157,51 @@ func TestLoad_IdentityOverridesFromConfig(t *testing.T) {
 	}
 }
 
+func TestLoad_IdentityOverrideRejectsTraversal(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantKey string
+	}{
+		{
+			name:    "os with separator",
+			yaml:    "identity:\n  os: \"../../etc\"\n",
+			wantKey: "identity.os",
+		},
+		{
+			name:    "os equal to dotdot",
+			yaml:    "identity:\n  os: \"..\"\n",
+			wantKey: "identity.os",
+		},
+		{
+			name:    "hostname with separator",
+			yaml:    "identity:\n  hostname: \"a/b\"\n",
+			wantKey: "identity.hostname",
+		},
+		{
+			name:    "username with backslash",
+			yaml:    "identity:\n  username: \"a\\\\b\"\n",
+			wantKey: "identity.username",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			writeConfig(t, UserConfigPath(), tc.yaml)
+
+			_, err := Load(ctx, Flags{DotfilesDir: t.TempDir()})
+			if err == nil {
+				t.Fatalf("Load: expected error for %s, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantKey) {
+				t.Errorf("error %q does not mention key %q", err.Error(), tc.wantKey)
+			}
+		})
+	}
+}
+
 func TestLoad_InvalidYAML(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
