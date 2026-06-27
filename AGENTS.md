@@ -92,6 +92,10 @@ fmt.Errorf("duplicate subfile")
 ### Test issues
 - Local security software might kill the test run. This is because some security software needs to scan and approve the code before it's allowed to run. This can take a bit of time, and every time `go test` is ran it generates a new binary that needs to be checked. The best solution in this situation is to compile the failing tests as a static binary and run that which should pass.
 
+## Merging
+
+PRs are merged using Squash merge. Remote branches are automatically deleted upon merge.
+
 ## Linting
 
 Use `golangci-lint` with the config at `.golangci.yml`. Minimum enabled linters:
