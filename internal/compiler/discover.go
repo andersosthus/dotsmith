@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/andersosthus/dotsmith/internal/identity"
+	"github.com/andersosthus/dotsmith/internal/state"
 )
 
 // filepathRelFunc is injectable for testing the error path of filepath.Rel.
@@ -97,26 +98,10 @@ func applyFile(_ context.Context, entries map[string]*FileEntry, absPath, rel, l
 	base := filepath.Base(rel)
 	dir := filepath.Dir(rel)
 
-	// Handle .ignore markers.
+	// Handle .ignore markers. The reserved-name check is intentionally skipped
+	// here: ignore markers only remove entries and cannot corrupt state.
 	if strings.HasSuffix(base, ".ignore") {
-		targetBase := strings.TrimSuffix(base, ".ignore")
-		targetRel := filepath.Join(dir, targetBase)
-		// Normalize dir for root-level files.
-		if dir == "." {
-			targetRel = targetBase
-		}
-
-		// Check if this .ignore targets a subfile or a regular file.
-		info := ParseSubfileName(targetBase)
-		if info != nil {
-			applyIgnoreToSubfile(entries, info.Target+info.Ext, targetBase, targetRel, layerLabel)
-		} else {
-			ignoreTarget := targetRel
-			if strings.HasSuffix(targetBase, ".age") {
-				ignoreTarget = strings.TrimSuffix(targetRel, ".age")
-			}
-			applyIgnoreToRegular(entries, ignoreTarget, layerLabel)
-		}
+		applyIgnoreMarker(entries, base, dir, layerLabel)
 		return nil
 	}
 
@@ -127,17 +112,51 @@ func applyFile(_ context.Context, entries map[string]*FileEntry, absPath, rel, l
 		if dir == "." {
 			target = info.Target + info.Ext
 		}
+		if err := checkReservedTarget(target, rel, layerLabel); err != nil {
+			return err
+		}
 		return applySubfile(entries, absPath, rel, target, info, layerLabel)
 	}
 
-	// Regular file: replaces any existing entry for this relative path.
-	// Strip .age from the target path so the compiled output has the plain name.
+	return applyRegular(entries, absPath, rel, base, layerLabel)
+}
+
+// applyIgnoreMarker processes a ".ignore" marker file, removing the targeted
+// subfile fragment or regular file entry.
+func applyIgnoreMarker(entries map[string]*FileEntry, base, dir, layerLabel string) {
+	targetBase := strings.TrimSuffix(base, ".ignore")
+	targetRel := filepath.Join(dir, targetBase)
+	// Normalize dir for root-level files.
+	if dir == "." {
+		targetRel = targetBase
+	}
+
+	// Check if this .ignore targets a subfile or a regular file.
+	info := ParseSubfileName(targetBase)
+	if info != nil {
+		applyIgnoreToSubfile(entries, info.Target+info.Ext, targetBase, targetRel, layerLabel)
+		return
+	}
+	ignoreTarget := targetRel
+	if strings.HasSuffix(targetBase, ".age") {
+		ignoreTarget = strings.TrimSuffix(targetRel, ".age")
+	}
+	applyIgnoreToRegular(entries, ignoreTarget, layerLabel)
+}
+
+// applyRegular registers a regular (non-subfile) file, replacing any existing
+// entry for the same target path. The .age suffix is stripped so the compiled
+// output has the plain name.
+func applyRegular(entries map[string]*FileEntry, absPath, rel, base, layerLabel string) error {
 	target := rel
 	encrypted := strings.HasSuffix(base, ".age")
 	if encrypted {
 		target = strings.TrimSuffix(rel, ".age")
 	}
-	e := &FileEntry{
+	if err := checkReservedTarget(target, rel, layerLabel); err != nil {
+		return err
+	}
+	entries[target] = &FileEntry{
 		Target:    target,
 		IsRegular: true,
 		Subfiles: []SubfileDesc{{
@@ -148,8 +167,23 @@ func applyFile(_ context.Context, entries map[string]*FileEntry, absPath, rel, l
 			SourceName: base,
 		}},
 	}
-	entries[target] = e
 	return nil
+}
+
+// checkReservedTarget rejects any managed file whose compiled output would
+// collide with dotsmith's own state file. Such a file would clobber the state
+// file inside the compile directory and corrupt dotsmith's bookkeeping.
+//
+// The guard intentionally matches only the root-level target
+// (target == state.FileName): the state file lives only at the compile root,
+// and compiledFileRefs likewise skips only rel == state.FileName.
+func checkReservedTarget(target, rel, layerLabel string) error {
+	if target != state.FileName {
+		return nil
+	}
+	return fmt.Errorf(
+		"discover: %q (layer %s) compiles to %q, a reserved dotsmith filename — rename it to manage it as a dotfile",
+		rel, layerLabel, state.FileName)
 }
 
 // applySubfile adds or replaces a subfile fragment in the target's FileEntry.

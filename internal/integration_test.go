@@ -23,6 +23,7 @@ import (
 	"github.com/andersosthus/dotsmith/internal/encrypt"
 	"github.com/andersosthus/dotsmith/internal/identity"
 	"github.com/andersosthus/dotsmith/internal/linker"
+	"github.com/andersosthus/dotsmith/internal/state"
 )
 
 // scenario bundles directories for an integration test.
@@ -458,6 +459,48 @@ func TestIntegration_ConflictError(t *testing.T) {
 	_, err := linker.Link(ctx, s.linkCfg(), refs)
 	if err == nil {
 		t.Fatal("expected conflict error, got nil")
+	}
+}
+
+// TestIntegration_ReservedStateFileNotClobbered verifies that a managed dotfile
+// named .dotsmith.state is rejected at compile time and the real state file
+// inside the compile directory is never overwritten.
+func TestIntegration_ReservedStateFileNotClobbered(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+
+	// Establish a real, valid state file inside the compile directory.
+	if err := os.MkdirAll(s.compileDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll compileDir: %v", err)
+	}
+	want := &state.State{Symlinks: map[string]state.SymlinkEntry{
+		".bashrc": {Source: "src", Target: "tgt", ContentHash: "deadbeef"},
+	}}
+	if err := state.Save(ctx, want, s.compileDir); err != nil {
+		t.Fatalf("state.Save: %v", err)
+	}
+
+	// A malicious/accidental managed dotfile that would compile to the state name.
+	s.writeBase(t, state.FileName, "this is not json and would corrupt state\n")
+
+	_, err := compiler.Compile(ctx, compiler.CompileConfig{
+		DotfilesDir: s.dotfiles,
+		Identity:    mustDetect(t),
+	})
+	if err == nil {
+		t.Fatal("Compile: expected error for reserved state filename, got nil")
+	}
+	if !strings.Contains(err.Error(), state.FileName) {
+		t.Errorf("error %q does not mention reserved filename", err.Error())
+	}
+
+	// The real state file must still load cleanly.
+	got, err := state.Load(ctx, s.compileDir)
+	if err != nil {
+		t.Fatalf("state.Load after rejected compile: %v", err)
+	}
+	if entry, ok := got.Symlinks[".bashrc"]; !ok || entry.ContentHash != "deadbeef" {
+		t.Errorf("state file was clobbered: got %+v", got.Symlinks)
 	}
 }
 
