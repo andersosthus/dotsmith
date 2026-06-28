@@ -4,13 +4,12 @@ package linker
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/andersosthus/dotsmith/internal/hash"
 	"github.com/andersosthus/dotsmith/internal/state"
 )
 
@@ -371,8 +370,7 @@ func removeEmptyParents(dir, stopAt string) {
 	}
 }
 
-// hashBytes returns the hex-encoded SHA-256 hash of data.
+// hashBytes returns the content digest of data via the shared hash helper.
 func hashBytes(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return hash.Sum(data)
 }

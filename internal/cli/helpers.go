@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,6 +12,7 @@ import (
 	"github.com/andersosthus/dotsmith/internal/compiler"
 	"github.com/andersosthus/dotsmith/internal/config"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
+	"github.com/andersosthus/dotsmith/internal/hash"
 	"github.com/andersosthus/dotsmith/internal/linker"
 	"github.com/andersosthus/dotsmith/internal/state"
 )
@@ -85,10 +84,9 @@ func compiledFileRefs(compileDir string) ([]linker.FileRef, error) {
 		if readErr != nil {
 			return fmt.Errorf("read %s: %w", path, readErr)
 		}
-		sum := sha256.Sum256(data)
 		refs = append(refs, linker.FileRef{
 			RelPath:     rel,
-			ContentHash: hex.EncodeToString(sum[:]),
+			ContentHash: hash.Sum(data),
 		})
 		return nil
 	})

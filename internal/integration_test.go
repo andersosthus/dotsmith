@@ -7,8 +7,6 @@ package internal_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"io/fs"
 	"os"
@@ -21,6 +19,7 @@ import (
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
+	"github.com/andersosthus/dotsmith/internal/hash"
 	"github.com/andersosthus/dotsmith/internal/identity"
 	"github.com/andersosthus/dotsmith/internal/linker"
 	"github.com/andersosthus/dotsmith/internal/state"
@@ -138,10 +137,9 @@ func compiledRefs(compileDir string) ([]linker.FileRef, error) {
 		if readErr != nil {
 			return readErr
 		}
-		sum := sha256.Sum256(data)
 		refs = append(refs, linker.FileRef{
 			RelPath:     rel,
-			ContentHash: hex.EncodeToString(sum[:]),
+			ContentHash: hash.Sum(data),
 		})
 		return nil
 	})

@@ -3,8 +3,6 @@ package compiler
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +10,7 @@ import (
 
 	"github.com/andersosthus/dotsmith/internal/comment"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
+	"github.com/andersosthus/dotsmith/internal/hash"
 	"github.com/andersosthus/dotsmith/internal/identity"
 )
 
@@ -307,8 +306,7 @@ func compiledFileMode(cf CompiledFile) os.FileMode {
 	return 0o644
 }
 
-// hashContent returns the hex-encoded SHA-256 hash of content.
+// hashContent returns the content digest of content via the shared hash helper.
 func hashContent(content []byte) string {
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:])
+	return hash.Sum(content)
 }
