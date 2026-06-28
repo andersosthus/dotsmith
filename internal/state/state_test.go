@@ -20,6 +20,84 @@ func TestNew(t *testing.T) {
 	if len(s.Symlinks) != 0 {
 		t.Errorf("New().Symlinks should be empty, got %d entries", len(s.Symlinks))
 	}
+	if s.Compiled == nil {
+		t.Error("New().Compiled should not be nil")
+	}
+	if len(s.Compiled) != 0 {
+		t.Errorf("New().Compiled should be empty, got %d entries", len(s.Compiled))
+	}
+}
+
+func TestSaveLoad_CompiledRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	original := New()
+	original.Symlinks[".bashrc"] = SymlinkEntry{Source: ".bashrc", Target: ".bashrc", ContentHash: "h1"}
+	original.Compiled[".bashrc"] = CompiledEntry{ContentHash: "h1"}
+	original.Compiled[".config/nvim/init.vim"] = CompiledEntry{ContentHash: "h2"}
+
+	if err := Save(ctx, original, dir); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(ctx, dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded.Compiled) != len(original.Compiled) {
+		t.Fatalf("len(Compiled) = %d, want %d", len(loaded.Compiled), len(original.Compiled))
+	}
+	for k, v := range original.Compiled {
+		got, ok := loaded.Compiled[k]
+		if !ok || got != v {
+			t.Errorf("Compiled[%q] = %v (ok=%v), want %v", k, got, ok, v)
+		}
+	}
+}
+
+func TestLoad_NullCompiled(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, stateFile)
+	// Legacy state with no compiled field — upgrade case.
+	if err := os.WriteFile(path, []byte(`{"symlinks":{}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s, err := Load(ctx, dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if s.Compiled == nil {
+		t.Error("Compiled should be initialised to an empty map, not nil")
+	}
+}
+
+func TestLoad_NonLocalCompiledRejected(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		json string
+	}{
+		{
+			name: "compiled key escapes with ..",
+			json: `{"symlinks":{},"compiled":{"../etc/passwd":{"content_hash":"d"}}}`,
+		},
+		{
+			name: "compiled key is absolute",
+			json: `{"symlinks":{},"compiled":{"/etc/passwd":{"content_hash":"d"}}}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, stateFile), []byte(tc.json), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			if _, err := Load(ctx, dir); err == nil {
+				t.Fatal("expected error for non-local compiled path, got nil")
+			}
+		})
+	}
 }
 
 func TestSaveLoad_RoundTrip(t *testing.T) {

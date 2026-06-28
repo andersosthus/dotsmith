@@ -1302,6 +1302,100 @@ func TestCompiledFileRefs_SkipsStateFile(t *testing.T) {
 	}
 }
 
+// stubWriteWithDangling makes writeCompiledFunc report a dangling set so the
+// CLI warning path can be exercised without staging a full prune on disk.
+func stubWriteWithDangling(t *testing.T, dangling []string) {
+	t.Helper()
+	orig := writeCompiledFunc
+	t.Cleanup(func() { writeCompiledFunc = orig })
+	writeCompiledFunc = func(_ context.Context, _ *compiler.CompileResult, _ compiler.WriteConfig) (compiler.WriteStats, error) {
+		return compiler.WriteStats{
+			Pruned:   dangling,
+			Dangling: dangling,
+		}, nil
+	}
+}
+
+// TestCompileCmd_DanglingWarning asserts a bare compile prints the
+// dangling-symlink warning, lists the paths, and advises running link.
+func TestCompileCmd_DanglingWarning(t *testing.T) {
+	stubWriteWithDangling(t, []string{".vimrc"})
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "x\n")
+
+	out, err := runWithDotfiles(t, root, "compile")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !strings.Contains(out, "dangle") {
+		t.Errorf("expected dangling warning, got: %q", out)
+	}
+	if !strings.Contains(out, ".vimrc") {
+		t.Errorf("expected dangling path listed, got: %q", out)
+	}
+	if !strings.Contains(out, "dotsmith link") {
+		t.Errorf("expected advice to run link, got: %q", out)
+	}
+}
+
+// TestCompileCmd_NoDanglingWarningWhenNone asserts no warning is printed when
+// nothing dangles.
+func TestCompileCmd_NoDanglingWarningWhenNone(t *testing.T) {
+	stubWriteWithDangling(t, nil)
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "x\n")
+
+	out, err := runWithDotfiles(t, root, "compile")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if strings.Contains(out, "dangle") {
+		t.Errorf("did not expect dangling warning, got: %q", out)
+	}
+}
+
+// TestApplyCmd_SuppressesDanglingWarning asserts apply does not print the
+// dangling warning even when files were pruned, since it links immediately after.
+func TestApplyCmd_SuppressesDanglingWarning(t *testing.T) {
+	stubWriteWithDangling(t, []string{".vimrc"})
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "x\n")
+	compileDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	out, err := run(t, "--dotfiles-dir", root, "apply",
+		"--compile-dir", compileDir, "--target-dir", targetDir)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if strings.Contains(out, "dangle") {
+		t.Errorf("apply should suppress dangling warning, got: %q", out)
+	}
+}
+
+// TestPrintDanglingWarning_CapsLongList asserts the warning caps the listed
+// paths and summarises the remainder when the list is long.
+func TestPrintDanglingWarning_CapsLongList(t *testing.T) {
+	var dangling []string
+	for i := 0; i < danglingWarnCap+5; i++ {
+		dangling = append(dangling, fmt.Sprintf(".f%d", i))
+	}
+	var buf bytes.Buffer
+	printDanglingWarning(&buf, dangling)
+	out := buf.String()
+	if !strings.Contains(out, "... and 5 more") {
+		t.Errorf("expected capped summary, got: %q", out)
+	}
+	// The first capped entries are listed; entries past the cap are not listed
+	// individually.
+	if !strings.Contains(out, ".f0") {
+		t.Errorf("expected first entry listed, got: %q", out)
+	}
+	if strings.Contains(out, fmt.Sprintf(".f%d\n", danglingWarnCap+4)) {
+		t.Errorf("entry past the cap should not be listed individually, got: %q", out)
+	}
+}
+
 // TestCompiledFileRefs_SkipsStateFileCaseVariant verifies a case variant of the
 // state filename is skipped too. On case-insensitive filesystems (APFS/HFS+,
 // NTFS) such a name folds onto the real state file, so it must never be treated

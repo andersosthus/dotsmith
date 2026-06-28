@@ -90,7 +90,7 @@ How each shell loads completions:
 | Command | Description |
 |---------|-------------|
 | `init` | Scaffold a new dotfiles repository structure |
-| `compile` | Discover, decrypt, and assemble dotfiles into the compile directory |
+| `compile` | Discover, decrypt, and assemble dotfiles into the compile directory; prune compiled files whose source no longer exists |
 | `link` | Create symlinks from the compile directory to the target directory |
 | `apply` | Compile dotfiles and link them to the target directory (compile + link) |
 | `render <relpath>` | Compile a single dotfile and print it to stdout |
@@ -161,6 +161,25 @@ into the target directory (`~` by default):
 ~/.profile  →  ~/.dotcompiled/.profile
 ~/.config/git/config  →  ~/.dotcompiled/.config/git/config
 ```
+
+### Pruning
+
+`compile` owns the compile directory. It records every file it produces in a
+manifest inside the state file (`.dotsmith.state`), and on each run it prunes any
+compiled file that the manifest lists but the current compile no longer produces
+— i.e. whose source was removed from your dotfiles repo. Pruning is scoped
+strictly to the compile directory (dotsmith only deletes files it created itself)
+and removes any parent directories left empty. The compile output line reports
+the count: `compiled: N written, M unchanged, P pruned`.
+
+When a pruned file still has a symlink pointing at it, that symlink is left
+dangling until the next `link`. A bare `compile` prints a warning listing the
+affected symlinks (capped, with a count of any remainder) and advising
+`dotsmith link`. `apply` does not print this warning: it runs `link` immediately
+after compiling, so the dangling symlinks are resolved before it returns.
+
+`--dry-run` reports the same pruned and dangling sets without writing, removing,
+or saving anything.
 
 ## Subfiles
 

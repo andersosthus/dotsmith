@@ -62,9 +62,13 @@ func newApplyCmd() *cobra.Command {
 				return fmt.Errorf("apply: link: %w", err)
 			}
 
+			// apply runs link immediately after compile, so any pruned file's
+			// dangling symlink is resolved before control returns. The
+			// dangling-symlink warning is therefore deliberately not printed here.
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"compiled: %d written, %d unchanged; linked: %d created, %d updated, %d unchanged, %d removed\n",
-				stats.Written, stats.Unchanged,
+				"compiled: %d written, %d unchanged, %d pruned; "+
+					"linked: %d created, %d updated, %d unchanged, %d removed\n",
+				stats.Written, stats.Unchanged, len(stats.Pruned),
 				linkResult.Created, linkResult.Updated, linkResult.Unchanged, linkResult.Removed)
 			return nil
 		},

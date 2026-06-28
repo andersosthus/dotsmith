@@ -570,6 +570,157 @@ func TestIntegration_DirectoryCleanup(t *testing.T) {
 	}
 }
 
+// removeBase removes a file from the base layer, fataling on error.
+func (s scenario) removeBase(t *testing.T, name string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(s.dotfiles, "base", name)); err != nil {
+		t.Fatalf("remove base %s: %v", name, err)
+	}
+}
+
+// TestIntegration_ApplyPrunesDeletedSourceLeavesNoTrace covers the apply path:
+// compile → link, then delete the source and compile+link again (as apply does)
+// leaves no compiled file, no symlink, and no state entries for the removed file.
+func TestIntegration_ApplyPrunesDeletedSourceLeavesNoTrace(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Delete the .vimrc source and re-run compile + link (the apply sequence).
+	s.removeBase(t, ".subfile-010.vimrc")
+	stats := s.compileAndWrite(t, ctx)
+	if want := []string{".vimrc"}; len(stats.Pruned) != 1 || stats.Pruned[0] != ".vimrc" {
+		t.Errorf("Pruned = %v, want %v", stats.Pruned, want)
+	}
+	if len(stats.Dangling) != 1 || stats.Dangling[0] != ".vimrc" {
+		t.Errorf("Dangling = %v, want [.vimrc]", stats.Dangling)
+	}
+	s.link(t, ctx)
+
+	// No compiled file, no symlink, no state entries remain for .vimrc.
+	if _, err := os.Stat(filepath.Join(s.compileDir, ".vimrc")); !os.IsNotExist(err) {
+		t.Errorf("compiled .vimrc should be gone, stat err = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); !os.IsNotExist(err) {
+		t.Errorf("symlink .vimrc should be gone, lstat err = %v", err)
+	}
+	st, err := state.Load(ctx, s.compileDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := st.Compiled[".vimrc"]; ok {
+		t.Error("manifest should not contain .vimrc")
+	}
+	if _, ok := st.Symlinks[".vimrc"]; ok {
+		t.Error("symlink state should not contain .vimrc")
+	}
+}
+
+// TestIntegration_BareCompileThenLinkRemovesDangling covers the split-command
+// path: a bare compile prunes the deleted file's compiled artifact and reports
+// the dangling symlink, then a bare link removes the now-dangling symlink.
+func TestIntegration_BareCompileThenLinkRemovesDangling(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	s.removeBase(t, ".subfile-010.vimrc")
+
+	// Bare compile prunes the compiled file and flags the dangling symlink.
+	stats := s.compileAndWrite(t, ctx)
+	if len(stats.Dangling) != 1 || stats.Dangling[0] != ".vimrc" {
+		t.Fatalf("Dangling = %v, want [.vimrc]", stats.Dangling)
+	}
+	// The symlink still dangles after a bare compile (compile never removes it).
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); err != nil {
+		t.Errorf("symlink should still exist after bare compile, lstat err = %v", err)
+	}
+
+	// Bare link then removes the dangling symlink.
+	s.link(t, ctx)
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); !os.IsNotExist(err) {
+		t.Errorf("symlink should be removed after link, lstat err = %v", err)
+	}
+}
+
+// TestIntegration_DeleteThenRecreateRoundTrips verifies a source removed and
+// re-added compiles and links correctly each time.
+func TestIntegration_DeleteThenRecreateRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Delete then re-link to clear .vimrc entirely.
+	s.removeBase(t, ".subfile-010.vimrc")
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Recreate .vimrc.
+	s.writeBase(t, ".subfile-010.vimrc", "set ruler\n")
+	stats := s.compileAndWrite(t, ctx)
+	if len(stats.Pruned) != 0 {
+		t.Errorf("recreate Pruned = %v, want empty", stats.Pruned)
+	}
+	s.link(t, ctx)
+
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); err != nil {
+		t.Errorf("symlink .vimrc should exist after recreate, lstat err = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.compileDir, ".vimrc"))
+	if err != nil {
+		t.Fatalf("ReadFile recreated .vimrc: %v", err)
+	}
+	if !strings.Contains(string(data), "set ruler") {
+		t.Errorf("recreated .vimrc content = %q, want 'set ruler'", data)
+	}
+}
+
+// TestIntegration_StatusStaleAfterPrune verifies status reports a symlink whose
+// compiled source was pruned as stale.
+func TestIntegration_StatusStaleAfterPrune(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Delete .vimrc source and bare-compile so its compiled file is pruned but
+	// the symlink (and its state entry) remain.
+	s.removeBase(t, ".subfile-010.vimrc")
+	s.compileAndWrite(t, ctx)
+
+	entries, err := linker.Status(ctx, s.linkCfg())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	var found bool
+	for _, e := range entries {
+		if e.RelPath == ".vimrc" {
+			found = true
+			if e.Kind != linker.StatusStale {
+				t.Errorf("status of pruned-source .vimrc = %s, want stale", e.Kind)
+			}
+		}
+	}
+	if !found {
+		t.Error(".vimrc not found in status entries")
+	}
+}
+
 // TestIntegration_CommentHeaders verifies comment headers are inserted for known extensions.
 func TestIntegration_CommentHeaders(t *testing.T) {
 	ctx := context.Background()

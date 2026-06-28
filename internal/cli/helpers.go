@@ -59,6 +59,35 @@ func printDryRunReports(w io.Writer, reports []compiler.DryRunReport) {
 	}
 }
 
+// danglingWarnCap is the maximum number of dangling paths listed individually
+// in the warning; beyond it the remainder is summarised as a count.
+const danglingWarnCap = 10
+
+// printDanglingWarning warns that pruning compiled files left symlinks pointing
+// at nothing and advises running link to clean them up. The path list is capped
+// so a large prune does not flood the terminal. It is a no-op when nothing
+// dangles. The apply command deliberately does not call this: it runs link
+// immediately, so the dangle never surfaces.
+func printDanglingWarning(w io.Writer, dangling []string) {
+	if len(dangling) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(w,
+		"warning: %d symlink(s) now dangle because their compiled source was pruned:\n",
+		len(dangling))
+	shown := dangling
+	if len(shown) > danglingWarnCap {
+		shown = shown[:danglingWarnCap]
+	}
+	for _, p := range shown {
+		_, _ = fmt.Fprintf(w, "  %s\n", p)
+	}
+	if len(dangling) > danglingWarnCap {
+		_, _ = fmt.Fprintf(w, "  ... and %d more\n", len(dangling)-danglingWarnCap)
+	}
+	_, _ = fmt.Fprintln(w, "run 'dotsmith link' to remove the dangling symlinks")
+}
+
 // compiledFileRefs walks compileDir and returns a FileRef for every compiled
 // file (skipping the state file and any hidden metadata).
 func compiledFileRefs(compileDir string) ([]linker.FileRef, error) {

@@ -49,8 +49,9 @@ func newCompileCmd() *cobra.Command {
 				return fmt.Errorf("write compiled: %w", err)
 			}
 
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "compiled: %d written, %d unchanged\n",
-				stats.Written, stats.Unchanged)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "compiled: %d written, %d unchanged, %d pruned\n",
+				stats.Written, stats.Unchanged, len(stats.Pruned))
+			printDanglingWarning(cmd.ErrOrStderr(), stats.Dangling)
 			return nil
 		},
 	}
