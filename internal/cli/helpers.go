@@ -48,13 +48,16 @@ func resolveIdentitySet(ctx context.Context, cfg config.Config) (encrypt.Identit
 // which identity would decrypt it on this machine — or that none would — without
 // having unlocked any key. It is a no-op when there are no reports.
 func printDryRunReports(w io.Writer, reports []compiler.DryRunReport) {
+	// SourcePath is a repo-controlled .age path whose basename may contain
+	// terminal control sequences; render repo-controlled paths with %q so
+	// escapes, CRs, and newlines cannot manipulate or spoof the terminal.
 	for _, r := range reports {
 		if r.Matched {
-			_, _ = fmt.Fprintf(w, "would decrypt %s -> %s [%s]\n", r.SourcePath, r.IdentityPath, r.IdentityKind)
+			_, _ = fmt.Fprintf(w, "would decrypt %q -> %q [%s]\n", r.SourcePath, r.IdentityPath, r.IdentityKind)
 			continue
 		}
 		_, _ = fmt.Fprintf(w,
-			"would NOT decrypt %s -> no identity on this machine matches any recipient\n",
+			"would NOT decrypt %q -> no identity on this machine matches any recipient\n",
 			r.SourcePath)
 	}
 }

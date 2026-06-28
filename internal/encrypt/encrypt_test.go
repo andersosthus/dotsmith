@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -581,6 +582,53 @@ func TestDecryptFile_EncryptedSSHKey_PromptNoticeNamesSource(t *testing.T) {
 	if got := notice.String(); !strings.Contains(got, agePath) ||
 		!strings.Contains(got, filepath.Join(sshDir, "id_ed25519")) {
 		t.Errorf("notice %q should name both the source file %q and the SSH key", got, agePath)
+	}
+}
+
+func TestDecryptFile_EncryptedSSHKey_PromptNoticeSanitizesSource(t *testing.T) {
+	// The .age basename is repo-controlled and may embed terminal control
+	// sequences. The prompt notice must render it with %q so escapes, CRs, and
+	// newlines cannot spoof or manipulate the terminal right before the genuine
+	// passphrase prompt (security finding run-5 / #42).
+	sshDir := t.TempDir()
+	withSSHDir(t, sshDir)
+	const pass = "hunter2"
+	_, pub := writeEd25519Key(t, sshDir, "id_ed25519", []byte(pass))
+
+	var notice bytes.Buffer
+	prev := promptNoticeWriter
+	promptNoticeWriter = &notice
+	t.Cleanup(func() { promptNoticeWriter = prev })
+
+	prompter := &fakePrompter{interactive: true, passphrase: []byte(pass)}
+	set, err := Resolve(context.Background(), KeySource{SSHDiscovery: true}, prompter)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	ct := encryptToRecipients(t, "secret", sshRecipient(t, pub))
+	// Basename embeds an ANSI clear-line, a CR, a forged prompt, and a newline.
+	evilName := "a\x1b[2K\rEnter passphrase for x: \n.age"
+	agePath := filepath.Join(t.TempDir(), evilName)
+	if werr := os.WriteFile(agePath, ct, 0o600); werr != nil {
+		t.Fatalf("write age file: %v", werr)
+	}
+
+	if _, derr := DecryptFile(context.Background(), agePath, set); derr != nil {
+		t.Fatalf("DecryptFile: %v", derr)
+	}
+	got := notice.String()
+	if strings.ContainsAny(got, "\x1b\r") {
+		t.Errorf("prompt notice leaks raw control characters: %q", got)
+	}
+	// A single notice line: an injected newline would have split it.
+	if c := strings.Count(got, "\n"); c != 1 {
+		t.Errorf("prompt notice has %d lines, want 1: %q", c, got)
+	}
+	// The escaped (%q) form of the path is what should be emitted.
+	if !strings.Contains(got, strconv.Quote(agePath)) {
+		t.Errorf("prompt notice should contain the %%q-rendered path %q, got %q",
+			strconv.Quote(agePath), got)
 	}
 }
 

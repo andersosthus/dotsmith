@@ -271,8 +271,12 @@ func encryptedSSHIdentity(
 			return nil, pendingErr
 		}
 		if currentSource != "" {
+			// currentSource is a repo-controlled .age path whose basename may
+			// contain terminal control sequences; render with %q so escapes,
+			// CRs, and newlines cannot spoof or manipulate the terminal right
+			// before the genuine passphrase prompt.
 			_, _ = fmt.Fprintf(promptNoticeWriter,
-				"dotsmith: decrypting %s requires SSH key %s\n", currentSource, path)
+				"dotsmith: decrypting %q requires SSH key %q\n", currentSource, path)
 		}
 		pass, perr := prompter.Prompt(path)
 		if perr != nil {
