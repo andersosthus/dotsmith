@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
 	"github.com/andersosthus/dotsmith/internal/config"
@@ -74,8 +75,10 @@ func compiledFileRefs(compileDir string) ([]linker.FileRef, error) {
 		if relErr != nil {
 			return relErr
 		}
-		// Skip the state file.
-		if rel == state.FileName {
+		// Skip the state file. Compared case-insensitively so a case variant
+		// (e.g. ".DOTSMITH.STATE") that folds onto the real state file on
+		// case-insensitive filesystems is not mistaken for a compiled file.
+		if strings.EqualFold(rel, state.FileName) {
 			return nil
 		}
 		data, readErr := os.ReadFile(path)

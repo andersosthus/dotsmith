@@ -1302,6 +1302,28 @@ func TestCompiledFileRefs_SkipsStateFile(t *testing.T) {
 	}
 }
 
+// TestCompiledFileRefs_SkipsStateFileCaseVariant verifies a case variant of the
+// state filename is skipped too. On case-insensitive filesystems (APFS/HFS+,
+// NTFS) such a name folds onto the real state file, so it must never be treated
+// as a compiled dotfile.
+func TestCompiledFileRefs_SkipsStateFileCaseVariant(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".DOTSMITH.STATE"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".bashrc"), []byte("data"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	refs, err := compiledFileRefs(dir)
+	if err != nil {
+		t.Fatalf("compiledFileRefs: %v", err)
+	}
+	if len(refs) != 1 || refs[0].RelPath != ".bashrc" {
+		t.Errorf("refs = %v, want [{.bashrc ...}]", refs)
+	}
+}
+
 // ---- shellQuote / hookBlockForBranch ---------------------------------------
 
 func TestShellQuote(t *testing.T) {
