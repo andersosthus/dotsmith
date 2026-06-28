@@ -45,6 +45,26 @@ _Avoid_: key scanning, auto-load.
 
 ### Compilation and linking
 
+**Source signature**:
+The per-target gate that lets compile *reuse* the existing compiled output
+instead of decrypting and reassembling. It is the **ordered** digest of each
+contributing subfile's content hash — the ciphertext hash for an `.age` source,
+the plaintext hash for a plain one. It moves when any subfile's body content
+changes, when subfiles are added or removed, or when their order changes; it
+deliberately ignores header-only changes (a rename or layer move with identical
+bytes), which affect only provenance comments. Distinct from a content hash,
+which fingerprints a single file's bytes.
+_Avoid_: source hash (overloads "content hash"), checksum.
+
+**Reuse** (compile):
+Skipping a target's decryption and reassembly because its source signature still
+matches the recorded one *and* its compiled output is still intact on disk —
+serving the already-compiled file untouched. A pure optimization: on any
+mismatch, missing output, or doubt, compile falls back to a full decrypt and
+recompile. Reuse is the point of the signature — it avoids the age passphrase
+prompt when nothing relevant changed.
+_Avoid_: cache, bare "skip" (too vague — say what is reused).
+
 **Compile manifest**:
 The recorded set of files the previous compile produced (relative path → content
 hash), persisted in the state file. It is the authority for what compile may
