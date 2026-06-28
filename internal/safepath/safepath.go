@@ -46,10 +46,22 @@ func Join(base, rel string) (string, error) {
 // the caller's paths. The climb also halts at the filesystem root as a final
 // backstop. Removal errors (including a non-empty directory) end the climb
 // silently — leaving a directory in place is never a failure.
+//
+// Each ancestor is Lstat'd before removal and the climb stops at the first
+// symlink: os.Remove issues unlink(2), which acts on the symlink itself rather
+// than the directory it points to, so removing a symlinked-directory ancestor
+// would silently unlink a user's non-managed symlink (e.g. ~/.config pointing at
+// a cloud-synced location) regardless of whether its target is empty. A
+// symlinked directory is never something dotsmith created via MkdirAll, so it is
+// always left in place. See ADR 0011's verify-then-disown invariant.
 func RemoveEmptyParents(dir, stopAt string) {
 	dir = filepath.Clean(dir)
 	stopAt = filepath.Clean(stopAt)
 	for dir != stopAt && dir != filepath.Dir(dir) {
+		fi, err := os.Lstat(dir)
+		if err != nil || fi.Mode()&os.ModeSymlink != 0 {
+			return
+		}
 		if err := os.Remove(dir); err != nil {
 			return
 		}

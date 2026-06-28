@@ -287,6 +287,9 @@ func linkOne(cfg LinkConfig, f FileRef, sourcePath, targetPath string, s *state.
 
 // linkNew creates a new symlink for a target that does not yet exist.
 func linkNew(cfg LinkConfig, f FileRef, sourcePath, targetPath string, s *state.State) (linkChange, error) {
+	if err := guardSymlinkedParents(cfg.TargetDir, targetPath); err != nil {
+		return linkUnchanged, err
+	}
 	if !cfg.DryRun {
 		if err := osMkdirAllFunc(filepath.Dir(targetPath), 0o755); err != nil {
 			return linkUnchanged, fmt.Errorf("create dir: %w", err)
@@ -299,6 +302,42 @@ func linkNew(cfg LinkConfig, f FileRef, sourcePath, targetPath string, s *state.
 		}
 	}
 	return linkCreated, nil
+}
+
+// guardSymlinkedParents refuses to create a managed link whose target sits below
+// a symlinked directory component between targetDir and the link's parent.
+//
+// os.MkdirAll silently follows a symlinked ancestor, planting the managed link
+// inside the directory the user's symlink points to (e.g. ~/.config pointing at a
+// cloud-synced location). That couples dotsmith's deletion sinks to a path the
+// user owns: subsequent orphan removal or clean would climb back through the
+// symlink. Treating a symlinked-dir ancestor as a conflict — mirroring
+// linkExisting's "exists and is not a symlink" guard — keeps managed links out of
+// user-owned symlinked directories in the first place. The leaf (targetPath) is
+// not inspected here: it is known absent (linkNew is the not-exist branch) and a
+// symlinked leaf is handled by linkExisting.
+func guardSymlinkedParents(targetDir, targetPath string) error {
+	targetDir = filepath.Clean(targetDir)
+	dir := filepath.Dir(targetPath)
+	for dir != targetDir && dir != filepath.Dir(dir) {
+		fi, err := osLstatFunc(dir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				dir = filepath.Dir(dir)
+				continue
+			}
+			return fmt.Errorf("stat parent %s: %w", dir, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf(
+				"conflict: parent %s is a symlink — refusing to plant a managed link inside it; "+
+					"replace the symlink with a real directory or move the target out from under it",
+				dir,
+			)
+		}
+		dir = filepath.Dir(dir)
+	}
+	return nil
 }
 
 // linkExisting handles a target path that already exists.

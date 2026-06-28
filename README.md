@@ -196,6 +196,15 @@ every run.
 paths (capped, with a count of any remainder). A correctly managed symlink is
 still removed as before.
 
+The same protection extends to **symlinked parent directories**. If a target's
+parent is itself a symlink you created — for example `~/.config` pointing at a
+cloud-synced location — dotsmith refuses to plant a managed link inside it:
+`link` reports a conflict and tells you to replace the symlink with a real
+directory or move the target out from under it. And when cleaning up empty
+directories after a removal, the climb stops at the first symlinked ancestor, so
+`clean` and orphan removal never unlink your symlinked parent dir. (The conflict
+fires in `--dry-run` too, so a dry run reports it without writing anything.)
+
 ### Clean
 
 `clean` tears down everything dotsmith created. It removes every managed symlink

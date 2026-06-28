@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/andersosthus/dotsmith/internal/state"
@@ -100,6 +101,17 @@ func injectReadlink(t *testing.T, fn func(string) (string, error)) {
 	orig := osReadlinkFunc
 	t.Cleanup(func() { osReadlinkFunc = orig })
 	osReadlinkFunc = fn
+}
+
+// makeDirs creates each given directory (and any parents), failing the test on
+// error.
+func makeDirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", d, err)
+		}
+	}
 }
 
 // ---- Link tests -------------------------------------------------------------
@@ -1426,6 +1438,227 @@ func TestHashBytes_Deterministic(t *testing.T) {
 	}
 	if len(h1) != 32 {
 		t.Errorf("hash length = %d, want 32 (hex XXH3-128)", len(h1))
+	}
+}
+
+// ---- symlinked-parent safety tests -----------------------------------------
+
+// TestClean_PreservesSymlinkedParent is the end-to-end reproduction from issue
+// #41: a user's non-managed symlinked parent dir (e.g. ~/.config -> a
+// cloud-synced location) must survive Clean's empty-parent cleanup. Without the
+// guard, os.Remove unlinks the symlink itself rather than rmdir'ing its
+// (non-empty) target, silently deleting the user's link.
+//
+// To reproduce the exact climb the bug exercises, the managed link is planted
+// directly inside the symlinked directory and recorded in state, bypassing
+// linkNew's new guard (which now refuses to create such a link in the first
+// place). This isolates the RemoveEmptyParents behaviour against the real Clean.
+func TestClean_PreservesSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	if err := os.WriteFile(filepath.Join(real, "precious.txt"), []byte("data\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile precious: %v", err)
+	}
+	// The user's NON-managed symlinked parent dir under target.
+	link := filepath.Join(target, ".config")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	// A compiled source and a managed leaf planted inside the symlinked dir,
+	// recorded in state as Target=.config/app.conf.
+	hash := writeCompiled(t, compile, ".config/app.conf", "managed\n")
+	if err := os.Symlink(filepath.Join(compile, ".config/app.conf"),
+		filepath.Join(real, "app.conf")); err != nil {
+		t.Fatalf("Symlink leaf: %v", err)
+	}
+	writeState(t, compile, ".config/app.conf", hash)
+
+	if _, err := Clean(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target}); err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+
+	// The user's symlink must still exist and still be a symlink.
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("user symlink %s was deleted: %v", link, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("expected %s to remain a symlink", link)
+	}
+	// The data behind it must remain.
+	if _, err := os.Stat(filepath.Join(real, "precious.txt")); err != nil {
+		t.Errorf("data behind symlink was lost: %v", err)
+	}
+}
+
+// TestLink_RefusesSymlinkedParent verifies linkNew treats a symlinked parent
+// component as a conflict, refusing to plant a managed link inside a user's
+// symlinked directory and leaving the symlink and its contents untouched.
+func TestLink_RefusesSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	link := filepath.Join(target, ".config")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked parent, got nil")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("error %q should explain the symlinked-parent conflict", err.Error())
+	}
+	// No managed link must have been planted inside the symlinked dir.
+	if _, statErr := os.Lstat(filepath.Join(real, "app.conf")); !os.IsNotExist(statErr) {
+		t.Error("expected no managed link planted inside the symlinked dir")
+	}
+	// The user's symlink survives.
+	if _, statErr := os.Lstat(link); statErr != nil {
+		t.Errorf("user symlink was disturbed: %v", statErr)
+	}
+}
+
+// TestLink_RefusesSymlinkedParent_Nested verifies the guard inspects every
+// ancestor between TargetDir and the leaf, not just the immediate parent.
+func TestLink_RefusesSymlinkedParent_Nested(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	// Symlink a higher ancestor (.config), with a deeper real path below it.
+	if err := os.Symlink(real, filepath.Join(target, ".config")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app/sub.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app/sub.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked ancestor, got nil")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("error %q should explain the symlinked-parent conflict", err.Error())
+	}
+}
+
+// TestLink_RefusesSymlinkedParent_DryRun verifies the guard fires even in dry
+// run, so a dry run faithfully reports the conflict it would hit.
+func TestLink_RefusesSymlinkedParent_DryRun(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	if err := os.Symlink(real, filepath.Join(target, ".config")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target, DryRun: true},
+		[]FileRef{{RelPath: ".config/app.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked parent in dry run, got nil")
+	}
+}
+
+// TestLink_RealNestedParent_NoConflict verifies the guard does not fire for an
+// ordinary nested target whose parents are real directories (or do not exist
+// yet), so normal nested linking is unaffected.
+func TestLink_RealNestedParent_NoConflict(t *testing.T) {
+	compile, target := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compile, ".config/app/sub.conf", "data\n")
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app/sub.conf", ContentHash: hash}})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Created != 1 {
+		t.Errorf("result = %+v, want Created=1", result)
+	}
+}
+
+// TestLink_SymlinkedParentGuard_LstatError verifies an unexpected lstat error on
+// a parent component (other than not-exist) is surfaced rather than swallowed.
+func TestLink_SymlinkedParentGuard_LstatError(t *testing.T) {
+	compile, target := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compile, ".config/app.conf", "data\n")
+	parent := filepath.Join(target, ".config")
+	injectLstat(t, func(p string) (os.FileInfo, error) {
+		if p == parent {
+			return nil, fmt.Errorf("forced lstat error")
+		}
+		return os.Lstat(p)
+	})
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected error from parent lstat, got nil")
+	}
+}
+
+// TestGuardSymlinkedParents_RootBackstop verifies the climb halts at the
+// filesystem root when targetDir is never an ancestor of the target, exercising
+// the dir == filepath.Dir(dir) backstop. Lstat is stubbed to report every
+// component as a non-existent real path so the walk runs to the root
+// deterministically, independent of the host filesystem layout.
+func TestGuardSymlinkedParents_RootBackstop(t *testing.T) {
+	injectLstat(t, func(string) (os.FileInfo, error) { return nil, os.ErrNotExist })
+	// targetDir is never an ancestor of the target path, so the loop walks up to
+	// the filesystem root and stops at the backstop rather than at targetDir.
+	if err := guardSymlinkedParents(
+		filepath.Join("never", "an", "ancestor"),
+		filepath.Join("a", "b", "c"),
+	); err != nil {
+		t.Fatalf("expected nil error at root backstop, got %v", err)
+	}
+}
+
+// TestLink_RealIntermediateThenSymlinkedAncestor verifies the guard climbs past
+// a real, existing intermediate directory before catching a symlinked ancestor
+// higher up, covering the multi-level real-then-symlink walk.
+func TestLink_RealIntermediateThenSymlinkedAncestor(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	// .config is a symlink; below it, a real "app" subdir exists in the target
+	// (created through the link so the immediate parent .config/app is a real,
+	// existing directory the climb walks past before reaching the .config symlink).
+	if err := os.Symlink(real, filepath.Join(target, ".config")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(real, "app"), 0o755); err != nil {
+		t.Fatalf("MkdirAll real/app: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app/sub.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app/sub.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked ancestor, got nil")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("error %q should explain the symlinked-parent conflict", err.Error())
 	}
 }
 
