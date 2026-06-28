@@ -515,8 +515,8 @@ func TestWriteCompiled_NestedMkdirError(t *testing.T) {
 
 func TestWriteCompiled_WriteError(t *testing.T) {
 	root := t.TempDir()
-	makeDir(t, root, "base")
-	writeFile(t, filepath.Join(root, "base"), ".subfile-010.bashrc", "export A=1\n")
+	base := makeDir(t, root, "base", "sub")
+	writeFile(t, base, ".subfile-010.bashrc", "export A=1\n")
 
 	ctx := context.Background()
 	result, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}})
@@ -524,15 +524,122 @@ func TestWriteCompiled_WriteError(t *testing.T) {
 		t.Fatalf("Compile: %v", err)
 	}
 
+	// Pre-create the file's parent directory inside the (writable) compile dir at
+	// a read-only mode so the per-file write fails. The compile dir itself stays
+	// writable so the WriteCompiled chmod of the compile dir succeeds.
 	compileDir := t.TempDir()
-	if err = os.Chmod(compileDir, 0o555); err != nil {
-		t.Fatalf("Chmod: %v", err)
+	subDir := filepath.Join(compileDir, "sub")
+	if err = os.Mkdir(subDir, 0o555); err != nil {
+		t.Fatalf("Mkdir: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(compileDir, 0o755) })
+	t.Cleanup(func() { _ = os.Chmod(subDir, 0o755) })
 
 	_, err = WriteCompiled(ctx, result, WriteConfig{CompileDir: compileDir})
 	if err == nil {
-		t.Fatal("expected error writing to read-only dir, got nil")
+		t.Fatal("expected error writing into read-only subdir, got nil")
+	}
+}
+
+// encryptedCompileResult builds a CompileResult with a single FromEncrypted
+// file at relPath whose content is the given bytes.
+func encryptedCompileResult(relPath string, content []byte) *CompileResult {
+	return &CompileResult{
+		Files: []CompiledFile{{
+			RelPath:       relPath,
+			Content:       content,
+			ContentHash:   hashContent(content),
+			FromEncrypted: true,
+		}},
+	}
+}
+
+// TestWriteCompiled_EncryptedRepairsExistingMode asserts a compiled file derived
+// from an encrypted source ends up 0600 across all three write paths even when
+// the destination already exists at a looser 0644 mode.
+func TestWriteCompiled_EncryptedRepairsExistingMode(t *testing.T) {
+	ctx := context.Background()
+	const relPath = ".secret"
+
+	t.Run("fresh write over pre-existing 0644", func(t *testing.T) {
+		compileDir := t.TempDir()
+		destPath := filepath.Join(compileDir, relPath)
+		// Pre-create the destination at a loose mode with different content so
+		// the write path (not the idempotency path) runs.
+		if err := os.WriteFile(destPath, []byte("old plaintext\n"), 0o644); err != nil {
+			t.Fatalf("seed dest: %v", err)
+		}
+
+		result := encryptedCompileResult(relPath, []byte("decrypted secret\n"))
+		stats, err := WriteCompiled(ctx, result, WriteConfig{CompileDir: compileDir})
+		if err != nil {
+			t.Fatalf("WriteCompiled: %v", err)
+		}
+		if stats.Written != 1 {
+			t.Errorf("Written = %d, want 1", stats.Written)
+		}
+		assertMode(t, destPath, 0o600)
+	})
+
+	t.Run("content-changed re-write over 0644", func(t *testing.T) {
+		compileDir := t.TempDir()
+		destPath := filepath.Join(compileDir, relPath)
+		if err := os.WriteFile(destPath, []byte("v1\n"), 0o644); err != nil {
+			t.Fatalf("seed dest: %v", err)
+		}
+
+		result := encryptedCompileResult(relPath, []byte("v2\n"))
+		if _, err := WriteCompiled(ctx, result, WriteConfig{CompileDir: compileDir}); err != nil {
+			t.Fatalf("WriteCompiled: %v", err)
+		}
+		assertMode(t, destPath, 0o600)
+	})
+
+	t.Run("content-unchanged idempotent run over 0644", func(t *testing.T) {
+		compileDir := t.TempDir()
+		destPath := filepath.Join(compileDir, relPath)
+		content := []byte("same secret\n")
+		// Pre-create with matching content but a loose mode; this exercises the
+		// idempotency early-return, which must still repair the mode.
+		if err := os.WriteFile(destPath, content, 0o644); err != nil {
+			t.Fatalf("seed dest: %v", err)
+		}
+
+		result := encryptedCompileResult(relPath, content)
+		stats, err := WriteCompiled(ctx, result, WriteConfig{CompileDir: compileDir})
+		if err != nil {
+			t.Fatalf("WriteCompiled: %v", err)
+		}
+		if stats.Unchanged != 1 {
+			t.Errorf("Unchanged = %d, want 1", stats.Unchanged)
+		}
+		assertMode(t, destPath, 0o600)
+	})
+}
+
+// TestWriteCompiled_TightensLooseCompileDir asserts a pre-existing, loosely
+// permissioned compile dir is brought back to 0700.
+func TestWriteCompiled_TightensLooseCompileDir(t *testing.T) {
+	ctx := context.Background()
+	compileDir := t.TempDir()
+	if err := os.Chmod(compileDir, 0o755); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+
+	result := encryptedCompileResult(".secret", []byte("secret\n"))
+	if _, err := WriteCompiled(ctx, result, WriteConfig{CompileDir: compileDir}); err != nil {
+		t.Fatalf("WriteCompiled: %v", err)
+	}
+	assertMode(t, compileDir, 0o700)
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat %s: %v", path, err)
+	}
+	if info.Mode().Perm() != want {
+		t.Errorf("%s mode = %o, want %o", path, info.Mode().Perm(), want)
 	}
 }
 
