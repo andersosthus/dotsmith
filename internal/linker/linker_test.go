@@ -48,6 +48,22 @@ func writeStateMulti(t *testing.T, compileDir string, entries map[string]string)
 	}
 }
 
+// writeStateWithManifest writes a state file with the given symlink entries and
+// compile manifest entries (relPath→hash for each).
+func writeStateWithManifest(t *testing.T, compileDir string, symlinks, compiled map[string]string) {
+	t.Helper()
+	s := state.New()
+	for relPath, hash := range symlinks {
+		s.Symlinks[relPath] = state.SymlinkEntry{Source: relPath, Target: relPath, ContentHash: hash}
+	}
+	for relPath, hash := range compiled {
+		s.Compiled[relPath] = state.CompiledEntry{ContentHash: hash}
+	}
+	if err := state.Save(context.Background(), s, compileDir); err != nil {
+		t.Fatalf("Save state: %v", err)
+	}
+}
+
 // writeCorruptState writes a file that is not valid JSON.
 func writeCorruptState(t *testing.T, compileDir string) {
 	t.Helper()
@@ -1066,6 +1082,129 @@ func TestClean_NonEmptyDirPreserved(t *testing.T) {
 	}
 }
 
+// TestClean_RemovesUnlinkedCompiledFile verifies that a compiled file recorded
+// in the manifest but never linked (no symlink entry) is removed by clean, and
+// that both state fields are zeroed afterwards.
+func TestClean_RemovesUnlinkedCompiledFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	// .bashrc is linked; .vimrc was compiled but never linked.
+	hashBash := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	hashVim := writeCompiled(t, compileDir, ".vimrc", "set noswap\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeStateWithManifest(t, compileDir,
+		map[string]string{".bashrc": hashBash},
+		map[string]string{".bashrc": hashBash, ".vimrc": hashVim})
+
+	ctx := context.Background()
+	if _, err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+
+	// Both compiled files must be gone — including the never-linked .vimrc.
+	assertGone(t, filepath.Join(compileDir, ".bashrc"))
+	assertGone(t, filepath.Join(compileDir, ".vimrc"))
+	// The linked symlink must be gone.
+	assertGone(t, filepath.Join(targetDir, ".bashrc"))
+
+	// Both state fields must be zeroed.
+	s, err := state.Load(ctx, compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if len(s.Symlinks) != 0 {
+		t.Errorf("Symlinks has %d entries after clean, want 0", len(s.Symlinks))
+	}
+	if len(s.Compiled) != 0 {
+		t.Errorf("Compiled has %d entries after clean, want 0", len(s.Compiled))
+	}
+}
+
+// TestClean_RemovesUnlinkedNestedCompiledFile verifies that a never-linked
+// compiled file in a nested path is removed and its now-empty parent
+// directories within the compile directory are cleaned up.
+func TestClean_RemovesUnlinkedNestedCompiledFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compileDir, ".config/nvim/init.lua", "vim.opt\n")
+	writeStateWithManifest(t, compileDir,
+		nil,
+		map[string]string{".config/nvim/init.lua": hash})
+
+	if _, err := Clean(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+
+	assertGone(t, filepath.Join(compileDir, ".config", "nvim", "init.lua"))
+	assertGone(t, filepath.Join(compileDir, ".config", "nvim"))
+	assertGone(t, filepath.Join(compileDir, ".config"))
+}
+
+// TestClean_UnlinkedCompiledAlreadyGone verifies a manifest entry whose compiled
+// file is already absent does not cause an error.
+func TestClean_UnlinkedCompiledAlreadyGone(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeStateWithManifest(t, compileDir,
+		nil,
+		map[string]string{".vimrc": "somehash"})
+
+	if _, err := Clean(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+		t.Fatalf("Clean with already-gone compiled file: %v", err)
+	}
+}
+
+// TestClean_UnlinkedCompiledRemoveError verifies an os.Remove failure while
+// removing a never-linked compiled file is surfaced.
+func TestClean_UnlinkedCompiledRemoveError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".vimrc", "set noswap\n")
+	writeStateWithManifest(t, compileDir,
+		nil,
+		map[string]string{".vimrc": "somehash"})
+
+	orig := osRemoveFunc
+	t.Cleanup(func() { osRemoveFunc = orig })
+	osRemoveFunc = func(path string) error {
+		if filepath.Base(path) == ".vimrc" {
+			return fmt.Errorf("forced remove error")
+		}
+		return orig(path)
+	}
+
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err == nil {
+		t.Fatal("expected error removing unlinked compiled file, got nil")
+	}
+}
+
+// TestCleanCompiled_NonLocalManifest_Refused verifies cleanCompiled refuses a
+// manifest key that escapes the compile directory and performs no out-of-tree
+// deletion. state.Load already rejects such a key, so this exercises the
+// belt-and-suspenders guard at the deletion sink directly.
+func TestCleanCompiled_NonLocalManifest_Refused(t *testing.T) {
+	compileDir := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+
+	rel, err := filepath.Rel(compileDir, victim)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	s := state.New()
+	s.Compiled[rel] = state.CompiledEntry{ContentHash: "h"}
+
+	cfg := LinkConfig{CompileDir: compileDir, TargetDir: t.TempDir()}
+	if err := cleanCompiled(cfg, s, map[string]struct{}{}); err == nil {
+		t.Fatal("expected cleanCompiled to refuse non-local manifest key, got nil")
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("victim file was deleted or unreadable: %v", statErr)
+	}
+}
+
 func TestClean_AlreadyGone(t *testing.T) {
 	// Files already removed from disk should not cause errors.
 	compileDir, targetDir := t.TempDir(), t.TempDir()
@@ -1238,7 +1377,7 @@ func TestCleanSymlinks_NonLocalTarget_Refused(t *testing.T) {
 	s := nonLocalState(rel)
 
 	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
-	if err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
+	if _, err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
 		t.Fatal("expected cleanSymlinks to refuse non-local target, got nil")
 	}
 	if _, statErr := os.Stat(victim); statErr != nil {
@@ -1265,7 +1404,7 @@ func TestCleanSymlinks_NonLocalSource_Refused(t *testing.T) {
 	s.Symlinks["evil"] = state.SymlinkEntry{Source: rel, Target: ".bashrc", ContentHash: "h"}
 
 	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
-	if err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
+	if _, err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
 		t.Fatal("expected cleanSymlinks to refuse non-local source, got nil")
 	}
 	if _, statErr := os.Stat(victim); statErr != nil {

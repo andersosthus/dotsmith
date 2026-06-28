@@ -97,7 +97,7 @@ How each shell loads completions:
 | `decrypt <file.age>` | Decrypt an age-encrypted file and print it to stdout |
 | `status` | Report the status of managed symlinks |
 | `identity` | Print the resolved OS, hostname, username, and user@host |
-| `clean` | Remove managed symlinks and compiled files |
+| `clean` | Remove managed symlinks and every compiled file dotsmith produced, emptying the compile directory |
 | `git install` | Append dotsmith hook to `post-merge` and `post-checkout`; `--branch <name>` restricts the hook to that branch |
 | `git remove` | Remove dotsmith hook from `post-merge` and `post-checkout` |
 | `shell <bash\|zsh\|fish>` | Generate shell completion script |
@@ -195,6 +195,20 @@ every run.
 `link`, `clean`, and `apply` print a warning on stderr listing any disowned
 paths (capped, with a count of any remainder). A correctly managed symlink is
 still removed as before.
+
+### Clean
+
+`clean` tears down everything dotsmith created. It removes every managed symlink
+(applying the disown guard above), then removes every compiled file recorded in
+the manifest — not just the ones that had a symlink, but also files that were
+compiled and never linked — so the compile directory is left holding no compiled
+files, only the state file. Now-empty parent directories within the compile
+directory are removed too. Finally it zeroes both state fields (the symlink
+records and the compile manifest).
+
+Each manifest entry is re-validated as living inside the compile directory before
+removal, and an already-missing file is tolerated rather than treated as an
+error.
 
 ## Subfiles
 

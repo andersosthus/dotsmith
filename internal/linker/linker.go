@@ -385,7 +385,13 @@ func statusOne(sourcePath, targetPath, stateHash string) StatusKind {
 }
 
 // Clean removes all managed symlinks, empty parent directories, and compiled
-// source files. In dry-run mode no changes are made.
+// source files, then zeroes both state fields (Symlinks and Compiled). In
+// dry-run mode no changes are made.
+//
+// It removes every compiled file recorded in the manifest (state.Compiled), not
+// only those that had a symlink entry, so a file that was compiled but never
+// linked is also torn down and the compile directory is left holding no compiled
+// files (only the state file).
 //
 // A target that is no longer a dotsmith-managed symlink (lstat + is-symlink +
 // readlink resolves to the expected source) is left untouched; its compiled
@@ -399,7 +405,11 @@ func Clean(ctx context.Context, cfg LinkConfig) (*CleanResult, error) {
 
 	result := &CleanResult{}
 	if !cfg.DryRun {
-		if err = cleanSymlinks(cfg, s, result); err != nil {
+		removed, err := cleanSymlinks(cfg, s, result)
+		if err != nil {
+			return nil, err
+		}
+		if err = cleanCompiled(cfg, s, removed); err != nil {
 			return nil, err
 		}
 		s = state.New()
@@ -418,15 +428,48 @@ func Clean(ctx context.Context, cfg LinkConfig) (*CleanResult, error) {
 // Each target is verified as a dotsmith-managed symlink before removal. A target
 // that is not (e.g. replaced by a real file of the user's) is left untouched and
 // recorded in result.Disowned; its compiled artifact is still removed.
-func cleanSymlinks(cfg LinkConfig, s *state.State, result *CleanResult) error {
+//
+// It returns the set of compiled Source paths it removed so the manifest sweep
+// (cleanCompiled) can skip them and only delete compiled files that were never
+// linked.
+func cleanSymlinks(cfg LinkConfig, s *state.State, result *CleanResult) (map[string]struct{}, error) {
+	removed := make(map[string]struct{}, len(s.Symlinks))
 	for relPath, entry := range s.Symlinks {
 		disowned, err := cleanSymlinkEntry(cfg, entry)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		removed[entry.Source] = struct{}{}
 		if disowned {
 			result.Disowned = append(result.Disowned, relPath)
 		}
+	}
+	return removed, nil
+}
+
+// cleanCompiled removes every compiled file recorded in the manifest
+// (s.Compiled) that cleanSymlinks did not already remove. This is what lets
+// clean empty the compile directory of files that were compiled but never
+// linked — cleanSymlinks only reaches files with a corresponding symlink entry.
+//
+// Each manifest key is re-validated as local under CompileDir before os.Remove,
+// so a state file that bypassed state.Load's containment check cannot delete
+// files outside the compile directory. A missing file is not an error (it may
+// have already been pruned). After removal, now-empty parent directories within
+// the compile directory are cleaned up.
+func cleanCompiled(cfg LinkConfig, s *state.State, alreadyRemoved map[string]struct{}) error {
+	for relPath := range s.Compiled {
+		if _, done := alreadyRemoved[relPath]; done {
+			continue
+		}
+		sourcePath, err := safepath.Join(cfg.CompileDir, relPath)
+		if err != nil {
+			return fmt.Errorf("clean: remove compiled: %w", err)
+		}
+		if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("clean: remove compiled %s: %w", sourcePath, err)
+		}
+		safepath.RemoveEmptyParents(filepath.Dir(sourcePath), cfg.CompileDir)
 	}
 	return nil
 }
