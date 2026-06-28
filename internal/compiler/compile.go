@@ -235,6 +235,11 @@ func WriteCompiled(ctx context.Context, result *CompileResult, cfg WriteConfig) 
 		if err := os.MkdirAll(cfg.CompileDir, 0o700); err != nil {
 			return WriteStats{}, fmt.Errorf("create compile dir %s: %w", cfg.CompileDir, err)
 		}
+		// MkdirAll does not tighten a pre-existing directory; chmod explicitly so
+		// a loose compile dir (e.g. 0755 from an older run) is brought to 0700.
+		if err := os.Chmod(cfg.CompileDir, 0o700); err != nil {
+			return WriteStats{}, fmt.Errorf("chmod compile dir %s: %w", cfg.CompileDir, err)
+		}
 	}
 
 	var stats WriteStats
@@ -266,20 +271,40 @@ func writeCompiledFile(_ context.Context, cf CompiledFile, cfg WriteConfig) (boo
 		return false, fmt.Errorf("create dir %s: %w", destDir, err)
 	}
 
+	perm := compiledFileMode(cf)
+
 	// Check existing content to avoid unnecessary writes.
 	existing, readErr := os.ReadFile(destPath)
 	if readErr == nil && hashContent(existing) == cf.ContentHash {
+		// Content is unchanged, but a pre-existing file may carry a stale,
+		// looser mode (os.WriteFile only applies perm on creation). Repair the
+		// mode for encrypted-derived files so the 0600 guarantee always holds.
+		if cf.FromEncrypted {
+			if err := os.Chmod(destPath, perm); err != nil {
+				return false, fmt.Errorf("chmod %s: %w", destPath, err)
+			}
+		}
 		return false, nil // unchanged
 	}
 
-	perm := os.FileMode(0o644)
-	if cf.FromEncrypted {
-		perm = 0o600
-	}
 	if err := os.WriteFile(destPath, cf.Content, perm); err != nil {
 		return false, fmt.Errorf("write %s: %w", destPath, err)
 	}
+	// os.WriteFile leaves the mode untouched when the file already exists, so
+	// chmod explicitly to enforce the intended mode on the changed path too.
+	if err := os.Chmod(destPath, perm); err != nil {
+		return false, fmt.Errorf("chmod %s: %w", destPath, err)
+	}
 	return true, nil
+}
+
+// compiledFileMode returns the file mode a compiled file should carry: 0600 for
+// files derived from an encrypted source, 0644 otherwise.
+func compiledFileMode(cf CompiledFile) os.FileMode {
+	if cf.FromEncrypted {
+		return 0o600
+	}
+	return 0o644
 }
 
 // hashContent returns the hex-encoded SHA-256 hash of content.
