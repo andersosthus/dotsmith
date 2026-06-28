@@ -597,6 +597,216 @@ func TestLink_RemoveOrphan_Mixed(t *testing.T) {
 	}
 }
 
+// ---- verify-then-disown tests -----------------------------------------------
+
+// writeFile writes a plain regular file at dir/relPath.
+func writeFile(t *testing.T, dir, relPath, content string) {
+	t.Helper()
+	p := filepath.Join(dir, relPath)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// assertFileContent fails unless the file at path has exactly want.
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("file %s removed or unreadable: %v", path, err)
+	}
+	if string(got) != want {
+		t.Errorf("file %s content = %q, want %q", path, string(got), want)
+	}
+}
+
+// assertGone fails unless path does not exist.
+func assertGone(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be gone, lstat err = %v", path, err)
+	}
+}
+
+// assertNoStateEntry fails unless the state at compileDir has no entry for relPath.
+func assertNoStateEntry(t *testing.T, compileDir, relPath string) {
+	t.Helper()
+	s, err := state.Load(context.Background(), compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if _, ok := s.Symlinks[relPath]; ok {
+		t.Errorf("expected %s dropped from state", relPath)
+	}
+}
+
+// TestLink_RemoveOrphan_DisownsReplacedFile verifies that when a managed
+// symlink's source is gone but the user has replaced the target with a real file
+// of their own, Link leaves the user's file untouched, removes the compiled
+// artifact, drops the state entry, and surfaces the disowned path.
+func TestLink_RemoveOrphan_DisownsReplacedFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "compiled\n")
+	// User replaced the managed symlink with a real file of their own.
+	writeFile(t, targetDir, ".bashrc", "my own content\n")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Removed != 0 {
+		t.Errorf("result.Removed = %d, want 0", result.Removed)
+	}
+	if len(result.Disowned) != 1 || result.Disowned[0] != ".bashrc" {
+		t.Errorf("result.Disowned = %v, want [.bashrc]", result.Disowned)
+	}
+
+	assertFileContent(t, filepath.Join(targetDir, ".bashrc"), "my own content\n")
+	assertGone(t, filepath.Join(compileDir, ".bashrc"))
+	assertNoStateEntry(t, compileDir, ".bashrc")
+}
+
+// TestLink_RemoveOrphan_DisownsForeignSymlink verifies that a target which is a
+// symlink pointing somewhere other than the expected compiled source is treated
+// as foreign and disowned (left untouched).
+func TestLink_RemoveOrphan_DisownsForeignSymlink(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "compiled\n")
+	// Target is a symlink the user created pointing elsewhere.
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(elsewhere, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(targetDir, ".bashrc")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	ctx := context.Background()
+	result, err := Link(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if len(result.Disowned) != 1 {
+		t.Fatalf("result.Disowned = %v, want one entry", result.Disowned)
+	}
+	// Foreign symlink left in place.
+	dst, err := os.Readlink(filepath.Join(targetDir, ".bashrc"))
+	if err != nil {
+		t.Fatalf("foreign symlink removed or unreadable: %v", err)
+	}
+	if dst != elsewhere {
+		t.Errorf("foreign symlink target = %q, want %q", dst, elsewhere)
+	}
+}
+
+// TestLink_RemoveOrphan_LstatError verifies an unexpected lstat error during
+// orphan removal is surfaced rather than silently disowning the path.
+func TestLink_RemoveOrphan_LstatError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectLstat(t, func(string) (os.FileInfo, error) {
+		return nil, fmt.Errorf("forced lstat error")
+	})
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err == nil {
+		t.Fatal("expected error from lstat during orphan removal, got nil")
+	}
+}
+
+// TestLink_RemoveOrphan_ReadlinkError verifies an unexpected readlink error
+// during orphan removal is surfaced rather than silently disowning the path.
+func TestLink_RemoveOrphan_ReadlinkError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectReadlink(t, func(string) (string, error) {
+		return "", fmt.Errorf("forced readlink error")
+	})
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err == nil {
+		t.Fatal("expected error from readlink during orphan removal, got nil")
+	}
+}
+
+// TestClean_DisownsReplacedFile verifies Clean leaves a user-substituted real
+// file untouched, removes the compiled artifact, and reports the disowned path.
+func TestClean_DisownsReplacedFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "compiled\n")
+	writeFile(t, targetDir, ".bashrc", "my own content\n")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	ctx := context.Background()
+	result, err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+	if len(result.Disowned) != 1 || result.Disowned[0] != ".bashrc" {
+		t.Errorf("result.Disowned = %v, want [.bashrc]", result.Disowned)
+	}
+	got, err := os.ReadFile(filepath.Join(targetDir, ".bashrc"))
+	if err != nil {
+		t.Fatalf("user file was removed or unreadable: %v", err)
+	}
+	if string(got) != "my own content\n" {
+		t.Errorf("user file content = %q, want unchanged", string(got))
+	}
+	if _, statErr := os.Lstat(filepath.Join(compileDir, ".bashrc")); !os.IsNotExist(statErr) {
+		t.Error("expected compiled artifact to be removed")
+	}
+}
+
+// TestClean_LstatError verifies an unexpected lstat error during clean is
+// surfaced rather than silently disowning the path.
+func TestClean_LstatError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectLstat(t, func(string) (os.FileInfo, error) {
+		return nil, fmt.Errorf("forced lstat error")
+	})
+
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err == nil {
+		t.Fatal("expected error from lstat during clean, got nil")
+	}
+}
+
+// TestClean_ReadlinkError verifies an unexpected readlink error during clean is
+// surfaced rather than silently disowning the path.
+func TestClean_ReadlinkError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectReadlink(t, func(string) (string, error) {
+		return "", fmt.Errorf("forced readlink error")
+	})
+
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err == nil {
+		t.Fatal("expected error from readlink during clean, got nil")
+	}
+}
+
 // ---- Status tests -----------------------------------------------------------
 
 func TestStatus_Empty(t *testing.T) {
@@ -774,7 +984,7 @@ func TestClean_Basic(t *testing.T) {
 	writeState(t, compileDir, ".bashrc", "somehash")
 
 	ctx := context.Background()
-	if err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -802,7 +1012,7 @@ func TestClean_DryRun(t *testing.T) {
 	makeSymlink(t, compileDir, targetDir, ".bashrc")
 	writeState(t, compileDir, ".bashrc", "somehash")
 
-	if err := Clean(context.Background(),
+	if _, err := Clean(context.Background(),
 		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true}); err != nil {
 		t.Fatalf("Clean dry-run: %v", err)
 	}
@@ -819,7 +1029,7 @@ func TestClean_NestedPathEmptyDirRemoval(t *testing.T) {
 	makeSymlink(t, compileDir, targetDir, ".config/git/config")
 	writeState(t, compileDir, ".config/git/config", "somehash")
 
-	if err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -846,7 +1056,7 @@ func TestClean_NonEmptyDirPreserved(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -862,7 +1072,7 @@ func TestClean_AlreadyGone(t *testing.T) {
 	writeState(t, compileDir, ".bashrc", "somehash")
 	// No symlink or compiled file created.
 
-	if err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean with already-gone files: %v", err)
 	}
 }
@@ -871,7 +1081,7 @@ func TestClean_LoadStateError(t *testing.T) {
 	compileDir := t.TempDir()
 	writeCorruptState(t, compileDir)
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: t.TempDir()})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: t.TempDir()})
 	if err == nil {
 		t.Fatal("expected error from corrupt state, got nil")
 	}
@@ -892,7 +1102,7 @@ func TestClean_SaveStateError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(compileDir, 0o755) })
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
 	if err == nil {
 		t.Fatal("expected error saving state, got nil")
 	}
@@ -914,7 +1124,7 @@ func TestClean_RemoveSymlinkError(t *testing.T) {
 		return orig(path)
 	}
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
 	if err == nil {
 		t.Fatal("expected error removing symlink, got nil")
 	}
@@ -936,7 +1146,7 @@ func TestClean_RemoveSourceError(t *testing.T) {
 		return orig(path)
 	}
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
 	if err == nil {
 		t.Fatal("expected error removing compiled file, got nil")
 	}
@@ -1028,7 +1238,7 @@ func TestCleanSymlinks_NonLocalTarget_Refused(t *testing.T) {
 	s := nonLocalState(rel)
 
 	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
-	if err := cleanSymlinks(cfg, s); err == nil {
+	if err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
 		t.Fatal("expected cleanSymlinks to refuse non-local target, got nil")
 	}
 	if _, statErr := os.Stat(victim); statErr != nil {
@@ -1055,7 +1265,7 @@ func TestCleanSymlinks_NonLocalSource_Refused(t *testing.T) {
 	s.Symlinks["evil"] = state.SymlinkEntry{Source: rel, Target: ".bashrc", ContentHash: "h"}
 
 	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
-	if err := cleanSymlinks(cfg, s); err == nil {
+	if err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
 		t.Fatal("expected cleanSymlinks to refuse non-local source, got nil")
 	}
 	if _, statErr := os.Stat(victim); statErr != nil {

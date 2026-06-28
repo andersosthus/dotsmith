@@ -181,6 +181,21 @@ after compiling, so the dangling symlinks are resolved before it returns.
 `--dry-run` reports the same pruned and dangling sets without writing, removing,
 or saving anything.
 
+### Disowned paths
+
+Before `link` removes an orphaned symlink, or `clean` removes a managed symlink,
+it verifies the target really is the symlink dotsmith created: it must be a
+symlink that still resolves to the expected compiled source. If the target is
+something else — most often because you replaced the symlink with a real file of
+your own — dotsmith *disowns* the path instead of deleting it. Your file is left
+untouched, but dotsmith stops tracking the path: it removes its own compiled
+artifact and drops the state entry, so it does not warn about the same path on
+every run.
+
+`link`, `clean`, and `apply` print a warning on stderr listing any disowned
+paths (capped, with a count of any remainder). A correctly managed symlink is
+still removed as before.
+
 ## Subfiles
 
 Subfiles let you split a single output file across multiple fragments, each potentially from a

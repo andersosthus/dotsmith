@@ -245,7 +245,7 @@ func TestIntegration_FullCycle(t *testing.T) {
 		t.Errorf("content missing expected subfiles: %q", content)
 	}
 
-	if err = linker.Clean(ctx, s.linkCfg()); err != nil {
+	if _, err = linker.Clean(ctx, s.linkCfg()); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 	if _, statErr := os.Lstat(symlink); !os.IsNotExist(statErr) {
@@ -558,7 +558,7 @@ func TestIntegration_DirectoryCleanup(t *testing.T) {
 		t.Fatalf("expected nested symlink %s: %v", symlink, statErr)
 	}
 
-	if err := linker.Clean(ctx, s.linkCfg()); err != nil {
+	if _, err := linker.Clean(ctx, s.linkCfg()); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -741,5 +741,109 @@ func TestIntegration_CommentHeaders(t *testing.T) {
 	content := string(result.Files[0].Content)
 	if !strings.Contains(content, "# ---") || !strings.Contains(content, "dotsmith") {
 		t.Errorf("expected dotsmith comment header, got: %q", content)
+	}
+}
+
+// TestIntegration_LinkDisownsUserReplacedFile covers the verify-then-disown path
+// end-to-end: after compile + link, the user replaces the managed symlink with a
+// real file of their own and deletes the source. A subsequent compile + link
+// must leave the user's file untouched while forgetting the path (compiled
+// artifact removed, state entry dropped, disown surfaced).
+func TestIntegration_LinkDisownsUserReplacedFile(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// User replaces the managed .vimrc symlink with a real file of their own.
+	vimrcTarget := filepath.Join(s.targetDir, ".vimrc")
+	if err := os.Remove(vimrcTarget); err != nil {
+		t.Fatalf("Remove symlink: %v", err)
+	}
+	const userContent = "\" my own vimrc\n"
+	if err := os.WriteFile(vimrcTarget, []byte(userContent), 0o644); err != nil {
+		t.Fatalf("WriteFile user vimrc: %v", err)
+	}
+
+	// Delete the source, then compile + link (the apply sequence).
+	s.removeBase(t, ".subfile-010.vimrc")
+	s.compileAndWrite(t, ctx)
+	lResult := s.link(t, ctx)
+
+	// The path was disowned, not removed.
+	if len(lResult.Disowned) != 1 || lResult.Disowned[0] != ".vimrc" {
+		t.Errorf("Disowned = %v, want [.vimrc]", lResult.Disowned)
+	}
+
+	// User's file is left untouched.
+	got, err := os.ReadFile(vimrcTarget)
+	if err != nil {
+		t.Fatalf("user vimrc removed or unreadable: %v", err)
+	}
+	if string(got) != userContent {
+		t.Errorf("user vimrc content = %q, want %q", string(got), userContent)
+	}
+
+	// Compiled artifact removed and state entry dropped — no perpetual retry.
+	if _, statErr := os.Lstat(filepath.Join(s.compileDir, ".vimrc")); !os.IsNotExist(statErr) {
+		t.Errorf("compiled .vimrc should be gone, lstat err = %v", statErr)
+	}
+	st, err := state.Load(ctx, s.compileDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := st.Symlinks[".vimrc"]; ok {
+		t.Error("symlink state should not contain .vimrc after disown")
+	}
+
+	// A second link does not re-warn about the now-forgotten path.
+	lResult2 := s.link(t, ctx)
+	if len(lResult2.Disowned) != 0 {
+		t.Errorf("second link Disowned = %v, want none", lResult2.Disowned)
+	}
+}
+
+// TestIntegration_CleanDisownsUserReplacedFile verifies clean refuses to delete a
+// path the user substituted with a real file, leaving it intact while still
+// removing the compiled artifact and reporting the disown.
+func TestIntegration_CleanDisownsUserReplacedFile(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// User replaces the managed symlink with a real file.
+	bashrcTarget := filepath.Join(s.targetDir, ".bashrc")
+	if err := os.Remove(bashrcTarget); err != nil {
+		t.Fatalf("Remove symlink: %v", err)
+	}
+	const userContent = "# my own bashrc\n"
+	if err := os.WriteFile(bashrcTarget, []byte(userContent), 0o644); err != nil {
+		t.Fatalf("WriteFile user bashrc: %v", err)
+	}
+
+	result, err := linker.Clean(ctx, s.linkCfg())
+	if err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+	if len(result.Disowned) != 1 || result.Disowned[0] != ".bashrc" {
+		t.Errorf("Disowned = %v, want [.bashrc]", result.Disowned)
+	}
+
+	// User's file is left untouched; compiled artifact is removed.
+	got, err := os.ReadFile(bashrcTarget)
+	if err != nil {
+		t.Fatalf("user bashrc removed or unreadable: %v", err)
+	}
+	if string(got) != userContent {
+		t.Errorf("user bashrc content = %q, want %q", string(got), userContent)
+	}
+	if _, statErr := os.Lstat(filepath.Join(s.compileDir, ".bashrc")); !os.IsNotExist(statErr) {
+		t.Errorf("compiled .bashrc should be gone, lstat err = %v", statErr)
 	}
 }

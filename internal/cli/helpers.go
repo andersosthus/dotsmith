@@ -88,6 +88,32 @@ func printDanglingWarning(w io.Writer, dangling []string) {
 	_, _ = fmt.Fprintln(w, "run 'dotsmith link' to remove the dangling symlinks")
 }
 
+// warnDisowned warns that one or more managed paths were left untouched because
+// they are no longer dotsmith-managed symlinks (e.g. the user replaced a symlink
+// with a real file of their own). dotsmith has stopped tracking those paths:
+// their compiled artifact was removed and their state entry dropped, so the
+// warning does not recur. The path list is capped to avoid flooding the
+// terminal. It is a no-op when nothing was disowned.
+func warnDisowned(w io.Writer, disowned []string) {
+	if len(disowned) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(w,
+		"warning: %d path(s) left untouched because they are no longer dotsmith-managed symlinks; "+
+			"dotsmith has stopped tracking them:\n",
+		len(disowned))
+	shown := disowned
+	if len(shown) > danglingWarnCap {
+		shown = shown[:danglingWarnCap]
+	}
+	for _, p := range shown {
+		_, _ = fmt.Fprintf(w, "  %s\n", p)
+	}
+	if len(disowned) > danglingWarnCap {
+		_, _ = fmt.Fprintf(w, "  ... and %d more\n", len(disowned)-danglingWarnCap)
+	}
+}
+
 // compiledFileRefs walks compileDir and returns a FileRef for every compiled
 // file (skipping the state file and any hidden metadata).
 func compiledFileRefs(compileDir string) ([]linker.FileRef, error) {
