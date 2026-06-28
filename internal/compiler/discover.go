@@ -206,8 +206,14 @@ func applyRegular(entries map[string]*FileEntry, absPath, rel, base, layerLabel 
 // The guard intentionally matches only the root-level target
 // (target == state.FileName): the state file lives only at the compile root,
 // and compiledFileRefs likewise skips only rel == state.FileName.
+//
+// The comparison is case-insensitive (strings.EqualFold): case-insensitive
+// filesystems (APFS/HFS+ on macOS, NTFS on Windows) fold a case variant such
+// as ".DOTSMITH.STATE" onto the real ".dotsmith.state", so an exact match
+// would let a crafted variant clobber the state file on the platforms we ship
+// darwin builds for.
 func checkReservedTarget(target, rel, layerLabel string) error {
-	if target != state.FileName {
+	if !strings.EqualFold(target, state.FileName) {
 		return nil
 	}
 	return fmt.Errorf(

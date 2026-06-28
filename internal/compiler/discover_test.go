@@ -522,6 +522,12 @@ func TestDiscover_ReservedStateFileRejected(t *testing.T) {
 		{name: "regular in base", layer: "base", file: ".dotsmith.state"},
 		{name: "encrypted in base", layer: "base", file: ".dotsmith.state.age"},
 		{name: "subfile in base", layer: "base", file: ".dotsmith.subfile-001.state"},
+		// Case variants must be rejected too: on case-insensitive filesystems
+		// (APFS/HFS+, NTFS) these fold onto the real ".dotsmith.state".
+		{name: "upper variant in base", layer: "base", file: ".DOTSMITH.STATE"},
+		{name: "mixed variant in base", layer: "base", file: ".Dotsmith.State"},
+		{name: "trailing variant in base", layer: "base", file: ".dotsmith.STATE"},
+		{name: "encrypted upper variant in base", layer: "base", file: ".DOTSMITH.STATE.age"},
 	}
 
 	for _, tc := range tests {
@@ -551,6 +557,51 @@ func TestDiscover_ReservedStateFileInOverrideLayer(t *testing.T) {
 	_, err := Discover(ctx, root, identity.Identity{OS: "linux"})
 	if err == nil {
 		t.Fatal("Discover: expected error for reserved file in override layer, got nil")
+	}
+}
+
+// TestCheckReservedTarget covers the case-insensitive comparison directly,
+// including exact, case-variant, and unrelated targets.
+func TestCheckReservedTarget(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    string
+		wantError bool
+	}{
+		{name: "exact", target: ".dotsmith.state", wantError: true},
+		{name: "upper variant", target: ".DOTSMITH.STATE", wantError: true},
+		{name: "mixed variant", target: ".Dotsmith.State", wantError: true},
+		{name: "trailing variant", target: ".dotsmith.STATE", wantError: true},
+		{name: "unrelated", target: ".bashrc", wantError: false},
+		{name: "substring not a match", target: ".dotsmith.state.bak", wantError: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkReservedTarget(tc.target, tc.target, "base")
+			if tc.wantError && err == nil {
+				t.Fatalf("checkReservedTarget(%q): expected error, got nil", tc.target)
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("checkReservedTarget(%q): unexpected error: %v", tc.target, err)
+			}
+		})
+	}
+}
+
+// TestCompile_CaseVariantCannotClobberStateFile verifies that a case variant of
+// the state filename in an adopted repo never reaches the write stage: Compile
+// fails during discovery, so a pre-existing state file in the compile directory
+// is left untouched. On case-insensitive filesystems (APFS/HFS+, NTFS) the
+// variant would otherwise fold onto and overwrite the real state file.
+func TestCompile_CaseVariantCannotClobberStateFile(t *testing.T) {
+	root := stubDotfiles(t)
+	base := filepath.Join(root, "base")
+	writeFile(t, base, ".DOTSMITH.STATE", "not json")
+
+	ctx := context.Background()
+	if _, err := Compile(ctx, CompileConfig{DotfilesDir: root, Identity: identity.Identity{}}); err == nil {
+		t.Fatal("Compile: expected error for case-variant reserved file, got nil")
 	}
 }
 
