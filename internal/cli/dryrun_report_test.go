@@ -111,11 +111,37 @@ func TestPrintDryRunReports_MatchAndNoMatch(t *testing.T) {
 		{SourcePath: "/d/b.age", Matched: false},
 	})
 	out := buf.String()
-	if !strings.Contains(out, "would decrypt /d/a.age -> /k/id [ssh-ed25519]") {
+	if !strings.Contains(out, `would decrypt "/d/a.age" -> "/k/id" [ssh-ed25519]`) {
 		t.Errorf("match line missing/incorrect: %q", out)
 	}
-	if !strings.Contains(out, "would NOT decrypt /d/b.age") {
+	if !strings.Contains(out, `would NOT decrypt "/d/b.age"`) {
 		t.Errorf("no-match line missing/incorrect: %q", out)
+	}
+}
+
+// TestPrintDryRunReports_SanitizesControlChars verifies a repo-controlled
+// .age path containing terminal control sequences (ANSI escapes, CR, newline)
+// is rendered with %q so it cannot manipulate or spoof the terminal.
+func TestPrintDryRunReports_SanitizesControlChars(t *testing.T) {
+	const evil = "/d/a\x1b[2K\rEnter passphrase: \n.age"
+	var buf bytes.Buffer
+	printDryRunReports(&buf, []compiler.DryRunReport{
+		{SourcePath: evil, Matched: true, IdentityPath: "/k/id", IdentityKind: "age"},
+		{SourcePath: evil, Matched: false},
+	})
+	out := buf.String()
+	// The raw escape, CR, and embedded newline must not appear verbatim.
+	if strings.ContainsAny(out, "\x1b\r") {
+		t.Errorf("output leaks raw control characters: %q", out)
+	}
+	// Exactly two report lines (one per report) plus a trailing newline; an
+	// injected newline would add a third.
+	if got := strings.Count(out, "\n"); got != 2 {
+		t.Errorf("expected 2 lines, got %d: %q", got, out)
+	}
+	// The escaped form (Go-quoted) is what should be emitted.
+	if !strings.Contains(out, `"/d/a\x1b[2K\rEnter passphrase: \n.age"`) {
+		t.Errorf("path not rendered in escaped %%q form: %q", out)
 	}
 }
 

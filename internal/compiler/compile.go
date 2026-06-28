@@ -3,16 +3,18 @@ package compiler
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/andersosthus/dotsmith/internal/comment"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
+	"github.com/andersosthus/dotsmith/internal/hash"
 	"github.com/andersosthus/dotsmith/internal/identity"
+	"github.com/andersosthus/dotsmith/internal/safepath"
+	"github.com/andersosthus/dotsmith/internal/state"
 )
 
 // CompileConfig holds the inputs for a compile operation.
@@ -37,7 +39,7 @@ type CompiledFile struct {
 	RelPath string
 	// Content is the assembled file content.
 	Content []byte
-	// ContentHash is the hex SHA-256 of Content.
+	// ContentHash is the hex content hash of Content.
 	ContentHash string
 	// FromEncrypted is true if any source subfile was age-encrypted.
 	FromEncrypted bool
@@ -78,6 +80,15 @@ type WriteStats struct {
 	Written int
 	// Unchanged is the number of files whose content was identical.
 	Unchanged int
+	// Pruned holds the relative paths of compiled files removed because their
+	// source no longer exists (present in the previous manifest, absent from the
+	// current result). Under DryRun these are the paths that would be pruned.
+	Pruned []string
+	// Dangling holds the subset of Pruned that still had a state.Symlinks entry
+	// and will therefore leave a dangling symlink in the target directory until
+	// link runs. It is computed by a read-only peek at the symlink state and
+	// never mutates it.
+	Dangling []string
 }
 
 // Compile discovers and assembles all dotfiles for the given configuration.
@@ -228,25 +239,47 @@ func validateNoDuplicates(entry *FileEntry) error {
 	return nil
 }
 
-// WriteCompiled writes compiled files to compileDir idempotently.
-// Files whose content has not changed are not rewritten.
+// WriteCompiled makes the compile directory reflect result idempotently.
+//
+// It owns the compile directory: it prunes any compiled file present in the
+// previous manifest (state.Compiled) but absent from result, then writes the
+// current files (skipping those whose content is unchanged), then — on full
+// success only — saves the new manifest. Pruning is scoped strictly to the
+// compile directory and cleans now-empty parent directories within it.
+//
+// The returned WriteStats lists the pruned relative paths and the subset that
+// still have a state.Symlinks entry (and will therefore dangle until link
+// runs). The symlink state is read only; it is never mutated.
+//
+// Under DryRun nothing is written, no file is pruned, and no state is saved, but
+// the prune and dangling sets are still computed and reported.
 func WriteCompiled(ctx context.Context, result *CompileResult, cfg WriteConfig) (WriteStats, error) {
-	if !cfg.DryRun {
-		if err := os.MkdirAll(cfg.CompileDir, 0o700); err != nil {
-			return WriteStats{}, fmt.Errorf("create compile dir %s: %w", cfg.CompileDir, err)
-		}
-		// MkdirAll does not tighten a pre-existing directory; chmod explicitly so
-		// a loose compile dir (e.g. 0755 from an older run) is brought to 0700.
-		if err := os.Chmod(cfg.CompileDir, 0o700); err != nil {
-			return WriteStats{}, fmt.Errorf("chmod compile dir %s: %w", cfg.CompileDir, err)
-		}
+	s, err := state.Load(ctx, cfg.CompileDir)
+	if err != nil {
+		return WriteStats{}, fmt.Errorf("write compiled: load state: %w", err)
 	}
 
-	var stats WriteStats
+	current := currentManifest(result)
+	pruned := pruneSet(s.Compiled, current)
+	dangling := danglingPaths(pruned, s.Symlinks)
+
+	stats := WriteStats{Pruned: pruned, Dangling: dangling}
+	if cfg.DryRun {
+		return stats, nil
+	}
+
+	if err = ensureCompileDir(cfg.CompileDir); err != nil {
+		return WriteStats{}, err
+	}
+
+	if err = prune(cfg.CompileDir, pruned); err != nil {
+		return WriteStats{}, err
+	}
+
 	for _, cf := range result.Files {
-		changed, err := writeCompiledFile(ctx, cf, cfg)
-		if err != nil {
-			return stats, err
+		changed, writeErr := writeCompiledFile(ctx, cf, cfg)
+		if writeErr != nil {
+			return WriteStats{}, writeErr
 		}
 		if changed {
 			stats.Written++
@@ -254,17 +287,95 @@ func WriteCompiled(ctx context.Context, result *CompileResult, cfg WriteConfig) 
 			stats.Unchanged++
 		}
 	}
+
+	// Save the manifest only after every file is on disk, so it never claims a
+	// file that was not written.
+	s.Compiled = current
+	if err = stateSaveFunc(ctx, s, cfg.CompileDir); err != nil {
+		return WriteStats{}, fmt.Errorf("write compiled: save state: %w", err)
+	}
 	return stats, nil
+}
+
+// stateSaveFunc is the manifest-saving sink, injectable so tests can exercise
+// the save-failure path that the always-writable compile dir otherwise hides.
+var stateSaveFunc = state.Save
+
+// ensureCompileDir creates the compile directory and enforces its 0700 mode.
+func ensureCompileDir(compileDir string) error {
+	if err := os.MkdirAll(compileDir, 0o700); err != nil {
+		return fmt.Errorf("create compile dir %s: %w", compileDir, err)
+	}
+	// MkdirAll does not tighten a pre-existing directory; chmod explicitly so a
+	// loose compile dir (e.g. 0755 from an older run) is brought to 0700.
+	if err := os.Chmod(compileDir, 0o700); err != nil {
+		return fmt.Errorf("chmod compile dir %s: %w", compileDir, err)
+	}
+	return nil
+}
+
+// currentManifest builds the manifest map for the current compile result.
+func currentManifest(result *CompileResult) map[string]state.CompiledEntry {
+	m := make(map[string]state.CompiledEntry, len(result.Files))
+	for _, cf := range result.Files {
+		m[cf.RelPath] = state.CompiledEntry{ContentHash: cf.ContentHash}
+	}
+	return m
+}
+
+// pruneSet returns the relative paths present in the previous manifest but
+// absent from the current compile result. The result is sorted for stable,
+// deterministic reporting (so two dry-runs report identically).
+func pruneSet(previous, current map[string]state.CompiledEntry) []string {
+	var pruned []string
+	for relPath := range previous {
+		if _, ok := current[relPath]; !ok {
+			pruned = append(pruned, relPath)
+		}
+	}
+	sort.Strings(pruned)
+	return pruned
+}
+
+// danglingPaths returns the subset of pruned paths that still have a symlink
+// entry and will therefore leave a dangling symlink until link runs. The
+// symlinks map is read only and never mutated. The result preserves the sorted
+// order of pruned.
+func danglingPaths(pruned []string, symlinks map[string]state.SymlinkEntry) []string {
+	var dangling []string
+	for _, relPath := range pruned {
+		if _, ok := symlinks[relPath]; ok {
+			dangling = append(dangling, relPath)
+		}
+	}
+	return dangling
+}
+
+// prune removes each pruned compiled file from compileDir and cleans the
+// now-empty parent directories within it. Each relative path is joined under the
+// compile directory with a containment check so a state entry that bypassed
+// state.Load cannot escape and delete files elsewhere.
+func prune(compileDir string, pruned []string) error {
+	for _, relPath := range pruned {
+		path, err := safepath.Join(compileDir, relPath)
+		if err != nil {
+			return fmt.Errorf("prune compiled: %w", err)
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("prune compiled %s: %w", path, err)
+		}
+		safepath.RemoveEmptyParents(filepath.Dir(path), compileDir)
+	}
+	return nil
 }
 
 // writeCompiledFile writes a single compiled file. Returns true if the file was
 // written (new or changed content), false if content was already up to date.
+//
+// It is only called on the non-dry-run path: WriteCompiled returns before
+// writing anything under DryRun.
 func writeCompiledFile(_ context.Context, cf CompiledFile, cfg WriteConfig) (bool, error) {
 	destPath := filepath.Join(cfg.CompileDir, cf.RelPath)
-
-	if cfg.DryRun {
-		return true, nil // treat as "would write" in dry-run
-	}
 
 	destDir := filepath.Dir(destPath)
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
@@ -307,8 +418,7 @@ func compiledFileMode(cf CompiledFile) os.FileMode {
 	return 0o644
 }
 
-// hashContent returns the hex-encoded SHA-256 hash of content.
+// hashContent returns the content digest of content via the shared hash helper.
 func hashContent(content []byte) string {
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:])
+	return hash.Sum(content)
 }

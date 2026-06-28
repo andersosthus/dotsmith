@@ -7,8 +7,6 @@ package internal_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"io/fs"
 	"os"
@@ -21,6 +19,7 @@ import (
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
 	"github.com/andersosthus/dotsmith/internal/encrypt"
+	"github.com/andersosthus/dotsmith/internal/hash"
 	"github.com/andersosthus/dotsmith/internal/identity"
 	"github.com/andersosthus/dotsmith/internal/linker"
 	"github.com/andersosthus/dotsmith/internal/state"
@@ -138,10 +137,9 @@ func compiledRefs(compileDir string) ([]linker.FileRef, error) {
 		if readErr != nil {
 			return readErr
 		}
-		sum := sha256.Sum256(data)
 		refs = append(refs, linker.FileRef{
 			RelPath:     rel,
-			ContentHash: hex.EncodeToString(sum[:]),
+			ContentHash: hash.Sum(data),
 		})
 		return nil
 	})
@@ -247,7 +245,7 @@ func TestIntegration_FullCycle(t *testing.T) {
 		t.Errorf("content missing expected subfiles: %q", content)
 	}
 
-	if err = linker.Clean(ctx, s.linkCfg()); err != nil {
+	if _, err = linker.Clean(ctx, s.linkCfg()); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 	if _, statErr := os.Lstat(symlink); !os.IsNotExist(statErr) {
@@ -560,7 +558,7 @@ func TestIntegration_DirectoryCleanup(t *testing.T) {
 		t.Fatalf("expected nested symlink %s: %v", symlink, statErr)
 	}
 
-	if err := linker.Clean(ctx, s.linkCfg()); err != nil {
+	if _, err := linker.Clean(ctx, s.linkCfg()); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -569,6 +567,157 @@ func TestIntegration_DirectoryCleanup(t *testing.T) {
 	}
 	if _, statErr := os.Lstat(filepath.Join(s.targetDir, ".config", "git")); !os.IsNotExist(statErr) {
 		t.Error(".config/git dir should be removed after clean")
+	}
+}
+
+// removeBase removes a file from the base layer, fataling on error.
+func (s scenario) removeBase(t *testing.T, name string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(s.dotfiles, "base", name)); err != nil {
+		t.Fatalf("remove base %s: %v", name, err)
+	}
+}
+
+// TestIntegration_ApplyPrunesDeletedSourceLeavesNoTrace covers the apply path:
+// compile → link, then delete the source and compile+link again (as apply does)
+// leaves no compiled file, no symlink, and no state entries for the removed file.
+func TestIntegration_ApplyPrunesDeletedSourceLeavesNoTrace(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Delete the .vimrc source and re-run compile + link (the apply sequence).
+	s.removeBase(t, ".subfile-010.vimrc")
+	stats := s.compileAndWrite(t, ctx)
+	if want := []string{".vimrc"}; len(stats.Pruned) != 1 || stats.Pruned[0] != ".vimrc" {
+		t.Errorf("Pruned = %v, want %v", stats.Pruned, want)
+	}
+	if len(stats.Dangling) != 1 || stats.Dangling[0] != ".vimrc" {
+		t.Errorf("Dangling = %v, want [.vimrc]", stats.Dangling)
+	}
+	s.link(t, ctx)
+
+	// No compiled file, no symlink, no state entries remain for .vimrc.
+	if _, err := os.Stat(filepath.Join(s.compileDir, ".vimrc")); !os.IsNotExist(err) {
+		t.Errorf("compiled .vimrc should be gone, stat err = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); !os.IsNotExist(err) {
+		t.Errorf("symlink .vimrc should be gone, lstat err = %v", err)
+	}
+	st, err := state.Load(ctx, s.compileDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := st.Compiled[".vimrc"]; ok {
+		t.Error("manifest should not contain .vimrc")
+	}
+	if _, ok := st.Symlinks[".vimrc"]; ok {
+		t.Error("symlink state should not contain .vimrc")
+	}
+}
+
+// TestIntegration_BareCompileThenLinkRemovesDangling covers the split-command
+// path: a bare compile prunes the deleted file's compiled artifact and reports
+// the dangling symlink, then a bare link removes the now-dangling symlink.
+func TestIntegration_BareCompileThenLinkRemovesDangling(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	s.removeBase(t, ".subfile-010.vimrc")
+
+	// Bare compile prunes the compiled file and flags the dangling symlink.
+	stats := s.compileAndWrite(t, ctx)
+	if len(stats.Dangling) != 1 || stats.Dangling[0] != ".vimrc" {
+		t.Fatalf("Dangling = %v, want [.vimrc]", stats.Dangling)
+	}
+	// The symlink still dangles after a bare compile (compile never removes it).
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); err != nil {
+		t.Errorf("symlink should still exist after bare compile, lstat err = %v", err)
+	}
+
+	// Bare link then removes the dangling symlink.
+	s.link(t, ctx)
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); !os.IsNotExist(err) {
+		t.Errorf("symlink should be removed after link, lstat err = %v", err)
+	}
+}
+
+// TestIntegration_DeleteThenRecreateRoundTrips verifies a source removed and
+// re-added compiles and links correctly each time.
+func TestIntegration_DeleteThenRecreateRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Delete then re-link to clear .vimrc entirely.
+	s.removeBase(t, ".subfile-010.vimrc")
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Recreate .vimrc.
+	s.writeBase(t, ".subfile-010.vimrc", "set ruler\n")
+	stats := s.compileAndWrite(t, ctx)
+	if len(stats.Pruned) != 0 {
+		t.Errorf("recreate Pruned = %v, want empty", stats.Pruned)
+	}
+	s.link(t, ctx)
+
+	if _, err := os.Lstat(filepath.Join(s.targetDir, ".vimrc")); err != nil {
+		t.Errorf("symlink .vimrc should exist after recreate, lstat err = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.compileDir, ".vimrc"))
+	if err != nil {
+		t.Fatalf("ReadFile recreated .vimrc: %v", err)
+	}
+	if !strings.Contains(string(data), "set ruler") {
+		t.Errorf("recreated .vimrc content = %q, want 'set ruler'", data)
+	}
+}
+
+// TestIntegration_StatusStaleAfterPrune verifies status reports a symlink whose
+// compiled source was pruned as stale.
+func TestIntegration_StatusStaleAfterPrune(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// Delete .vimrc source and bare-compile so its compiled file is pruned but
+	// the symlink (and its state entry) remain.
+	s.removeBase(t, ".subfile-010.vimrc")
+	s.compileAndWrite(t, ctx)
+
+	entries, err := linker.Status(ctx, s.linkCfg())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	var found bool
+	for _, e := range entries {
+		if e.RelPath == ".vimrc" {
+			found = true
+			if e.Kind != linker.StatusStale {
+				t.Errorf("status of pruned-source .vimrc = %s, want stale", e.Kind)
+			}
+		}
+	}
+	if !found {
+		t.Error(".vimrc not found in status entries")
 	}
 }
 
@@ -592,5 +741,109 @@ func TestIntegration_CommentHeaders(t *testing.T) {
 	content := string(result.Files[0].Content)
 	if !strings.Contains(content, "# ---") || !strings.Contains(content, "dotsmith") {
 		t.Errorf("expected dotsmith comment header, got: %q", content)
+	}
+}
+
+// TestIntegration_LinkDisownsUserReplacedFile covers the verify-then-disown path
+// end-to-end: after compile + link, the user replaces the managed symlink with a
+// real file of their own and deletes the source. A subsequent compile + link
+// must leave the user's file untouched while forgetting the path (compiled
+// artifact removed, state entry dropped, disown surfaced).
+func TestIntegration_LinkDisownsUserReplacedFile(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+	s.writeBase(t, ".subfile-010.vimrc", "set number\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// User replaces the managed .vimrc symlink with a real file of their own.
+	vimrcTarget := filepath.Join(s.targetDir, ".vimrc")
+	if err := os.Remove(vimrcTarget); err != nil {
+		t.Fatalf("Remove symlink: %v", err)
+	}
+	const userContent = "\" my own vimrc\n"
+	if err := os.WriteFile(vimrcTarget, []byte(userContent), 0o644); err != nil {
+		t.Fatalf("WriteFile user vimrc: %v", err)
+	}
+
+	// Delete the source, then compile + link (the apply sequence).
+	s.removeBase(t, ".subfile-010.vimrc")
+	s.compileAndWrite(t, ctx)
+	lResult := s.link(t, ctx)
+
+	// The path was disowned, not removed.
+	if len(lResult.Disowned) != 1 || lResult.Disowned[0] != ".vimrc" {
+		t.Errorf("Disowned = %v, want [.vimrc]", lResult.Disowned)
+	}
+
+	// User's file is left untouched.
+	got, err := os.ReadFile(vimrcTarget)
+	if err != nil {
+		t.Fatalf("user vimrc removed or unreadable: %v", err)
+	}
+	if string(got) != userContent {
+		t.Errorf("user vimrc content = %q, want %q", string(got), userContent)
+	}
+
+	// Compiled artifact removed and state entry dropped — no perpetual retry.
+	if _, statErr := os.Lstat(filepath.Join(s.compileDir, ".vimrc")); !os.IsNotExist(statErr) {
+		t.Errorf("compiled .vimrc should be gone, lstat err = %v", statErr)
+	}
+	st, err := state.Load(ctx, s.compileDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := st.Symlinks[".vimrc"]; ok {
+		t.Error("symlink state should not contain .vimrc after disown")
+	}
+
+	// A second link does not re-warn about the now-forgotten path.
+	lResult2 := s.link(t, ctx)
+	if len(lResult2.Disowned) != 0 {
+		t.Errorf("second link Disowned = %v, want none", lResult2.Disowned)
+	}
+}
+
+// TestIntegration_CleanDisownsUserReplacedFile verifies clean refuses to delete a
+// path the user substituted with a real file, leaving it intact while still
+// removing the compiled artifact and reporting the disown.
+func TestIntegration_CleanDisownsUserReplacedFile(t *testing.T) {
+	ctx := context.Background()
+	s := newScenario(t)
+	s.writeBase(t, ".subfile-010.bashrc", "export A=1\n")
+
+	s.compileAndWrite(t, ctx)
+	s.link(t, ctx)
+
+	// User replaces the managed symlink with a real file.
+	bashrcTarget := filepath.Join(s.targetDir, ".bashrc")
+	if err := os.Remove(bashrcTarget); err != nil {
+		t.Fatalf("Remove symlink: %v", err)
+	}
+	const userContent = "# my own bashrc\n"
+	if err := os.WriteFile(bashrcTarget, []byte(userContent), 0o644); err != nil {
+		t.Fatalf("WriteFile user bashrc: %v", err)
+	}
+
+	result, err := linker.Clean(ctx, s.linkCfg())
+	if err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+	if len(result.Disowned) != 1 || result.Disowned[0] != ".bashrc" {
+		t.Errorf("Disowned = %v, want [.bashrc]", result.Disowned)
+	}
+
+	// User's file is left untouched; compiled artifact is removed.
+	got, err := os.ReadFile(bashrcTarget)
+	if err != nil {
+		t.Fatalf("user bashrc removed or unreadable: %v", err)
+	}
+	if string(got) != userContent {
+		t.Errorf("user bashrc content = %q, want %q", string(got), userContent)
+	}
+	if _, statErr := os.Lstat(filepath.Join(s.compileDir, ".bashrc")); !os.IsNotExist(statErr) {
+		t.Errorf("compiled .bashrc should be gone, lstat err = %v", statErr)
 	}
 }

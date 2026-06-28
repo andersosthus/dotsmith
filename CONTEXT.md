@@ -42,3 +42,40 @@ Building the candidate set from the machine automatically — primarily by readi
 the SSH keys already present on the machine — rather than requiring each one to
 be named in config.
 _Avoid_: key scanning, auto-load.
+
+### Compilation and linking
+
+**Compile manifest**:
+The recorded set of files the previous compile produced (relative path → content
+hash), persisted in the state file. It is the authority for what compile may
+*prune* — compile deletes only files it knows it created, never whatever it finds
+in the compile directory.
+_Avoid_: file list, index, cache.
+
+**Prune**:
+Removing a compiled file from the compile directory because its source no longer
+exists. A compile-time act, scoped to the compile directory only.
+_Avoid_: clean (that is the user-facing teardown command), delete (too vague).
+
+**Orphaned compiled file**:
+A file in the compile directory present in the previous manifest but absent from
+the current compile result — i.e. its source was removed. Pruning targets exactly
+these.
+_Avoid_: bare "orphan" (ambiguous with the symlink sense below).
+
+**Orphaned symlink**:
+A managed symlink in the state file with no corresponding file in the current
+compile result. The linker removes these; pruning does not.
+_Avoid_: bare "orphan".
+
+**Dangling symlink**:
+A managed symlink in the target directory whose compiled source has been pruned.
+A transient state a bare `compile` can leave behind; the next `link` resolves it.
+_Avoid_: broken link, stale link (stale has a distinct meaning — content changed,
+not source removed).
+
+**Disown**:
+Ceasing to manage a path — dropping its state entry and removing dotsmith's own
+artifact — without touching what the user has put in its place. Done when a
+managed symlink has been replaced by a real file the user created.
+_Avoid_: orphan, abandon, release.

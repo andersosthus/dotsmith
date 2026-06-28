@@ -18,11 +18,12 @@ func newCleanCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg := mustGetCfg(cmd)
 
-			if err := cleanFunc(cmd.Context(), linker.LinkConfig{
+			result, err := cleanFunc(cmd.Context(), linker.LinkConfig{
 				CompileDir: cfg.CompileDir,
 				TargetDir:  cfg.TargetDir,
 				DryRun:     cfg.DryRun,
-			}); err != nil {
+			})
+			if err != nil {
 				return fmt.Errorf("clean: %w", err)
 			}
 
@@ -31,6 +32,7 @@ func newCleanCmd() *cobra.Command {
 			} else {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "clean: done")
 			}
+			warnDisowned(cmd.ErrOrStderr(), result.Disowned)
 			return nil
 		},
 	}

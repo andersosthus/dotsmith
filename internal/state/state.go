@@ -26,7 +26,21 @@ type SymlinkEntry struct {
 	Source string `json:"source"`
 	// Target is the path to the symlink in the target directory.
 	Target string `json:"target"`
-	// ContentHash is the hex-encoded SHA-256 hash of Source at link time.
+	// ContentHash is the hex-encoded content hash of Source at link time.
+	ContentHash string `json:"content_hash"`
+}
+
+// CompiledEntry records a single file the previous compile produced. It is the
+// manifest unit that lets compile prune only files it created itself.
+//
+// The content hash is stored even though pruning only needs the key set: it
+// enables a future compile to detect a locally-edited compiled file. A linked
+// file's hash is therefore stored twice — here (what was compiled) and in its
+// SymlinkEntry (what was linked) — answering different questions; the two are
+// intentionally not deduped.
+type CompiledEntry struct {
+	// ContentHash is the hex-encoded content hash of the compiled file at the
+	// time it was produced.
 	ContentHash string `json:"content_hash"`
 }
 
@@ -34,11 +48,20 @@ type SymlinkEntry struct {
 type State struct {
 	// Symlinks maps target paths to their SymlinkEntry.
 	Symlinks map[string]SymlinkEntry `json:"symlinks"`
+	// Compiled is the compile manifest: it maps each compiled file's path
+	// (relative to the compile directory) to its CompiledEntry. It records
+	// exactly the files the previous compile produced so that the next compile
+	// can prune the ones whose source has since disappeared.
+	Compiled map[string]CompiledEntry `json:"compiled"`
 }
 
-// New returns an empty State ready for use.
+// New returns an empty State ready for use, with both Symlinks and Compiled
+// zeroed.
 func New() *State {
-	return &State{Symlinks: make(map[string]SymlinkEntry)}
+	return &State{
+		Symlinks: make(map[string]SymlinkEntry),
+		Compiled: make(map[string]CompiledEntry),
+	}
 }
 
 // Load reads the state file from compileDir. If the file does not exist, an
@@ -58,22 +81,45 @@ func Load(_ context.Context, compileDir string) (*State, error) {
 	if err = json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("load state from %s: parse JSON: %w", path, err)
 	}
-	// Reject entries whose paths escape their directory (e.g. "../"). A state
-	// file is only trusted to reference files within the compile/target dirs;
-	// non-local paths would let a crafted state file delete arbitrary files.
+	if err = validateLocalPaths(path, &s); err != nil {
+		return nil, err
+	}
+	if s.Symlinks == nil {
+		s.Symlinks = make(map[string]SymlinkEntry)
+	}
+	if s.Compiled == nil {
+		s.Compiled = make(map[string]CompiledEntry)
+	}
+	return &s, nil
+}
+
+// validateLocalPaths rejects any state entry whose paths escape their directory
+// (e.g. "../"). A state file is only trusted to reference files within the
+// compile/target directories; a non-local path would let a crafted state file
+// delete arbitrary files elsewhere. path is used only for error context.
+func validateLocalPaths(path string, s *State) error {
 	for k, e := range s.Symlinks {
 		if !filepath.IsLocal(e.Target) || !filepath.IsLocal(e.Source) {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"load state from %s: entry %q has non-local path (source=%q target=%q) — "+
 					"refusing a state file that escapes its directory",
 				path, k, e.Source, e.Target,
 			)
 		}
 	}
-	if s.Symlinks == nil {
-		s.Symlinks = make(map[string]SymlinkEntry)
+	// Manifest keys are joined under the compile directory at prune time; reject
+	// any that escape it so a crafted state file cannot make compile delete
+	// arbitrary files outside the compile directory.
+	for k := range s.Compiled {
+		if !filepath.IsLocal(k) {
+			return fmt.Errorf(
+				"load state from %s: compiled entry %q has non-local path — "+
+					"refusing a state file that escapes its directory",
+				path, k,
+			)
+		}
 	}
-	return &s, nil
+	return nil
 }
 
 // jsonMarshalIndentFunc is injectable for testing.

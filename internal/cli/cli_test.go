@@ -393,6 +393,24 @@ func TestLinkCmd_CompiledFileRefsError(t *testing.T) {
 	}
 }
 
+func TestLinkCmd_WarnsDisowned(t *testing.T) {
+	orig := linkFunc
+	t.Cleanup(func() { linkFunc = orig })
+	linkFunc = func(_ context.Context, _ linker.LinkConfig, _ []linker.FileRef) (*linker.LinkResult, error) {
+		return &linker.LinkResult{Disowned: []string{".vimrc"}}, nil
+	}
+
+	root := makeDotfiles(t)
+	out, err := run(t, "--dotfiles-dir", root, "link",
+		"--compile-dir", t.TempDir(), "--target-dir", t.TempDir())
+	if err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	if !strings.Contains(out, "no longer dotsmith-managed") || !strings.Contains(out, ".vimrc") {
+		t.Errorf("link output = %q, want disown warning mentioning .vimrc", out)
+	}
+}
+
 // ---- apply ------------------------------------------------------------------
 
 func TestApplyCmd_Success(t *testing.T) {
@@ -449,6 +467,24 @@ func TestApplyCmd_LinkError(t *testing.T) {
 	_, err := runWithDotfiles(t, root, "apply")
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestApplyCmd_WarnsDisowned(t *testing.T) {
+	orig := linkFunc
+	t.Cleanup(func() { linkFunc = orig })
+	linkFunc = func(_ context.Context, _ linker.LinkConfig, _ []linker.FileRef) (*linker.LinkResult, error) {
+		return &linker.LinkResult{Disowned: []string{".gitconfig"}}, nil
+	}
+
+	root := makeDotfiles(t)
+	out, err := run(t, "--dotfiles-dir", root, "apply",
+		"--compile-dir", t.TempDir(), "--target-dir", t.TempDir())
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !strings.Contains(out, "no longer dotsmith-managed") || !strings.Contains(out, ".gitconfig") {
+		t.Errorf("apply output = %q, want disown warning mentioning .gitconfig", out)
 	}
 }
 
@@ -688,7 +724,9 @@ func TestStatusCmd_Error(t *testing.T) {
 func TestCleanCmd_Success(t *testing.T) {
 	orig := cleanFunc
 	t.Cleanup(func() { cleanFunc = orig })
-	cleanFunc = func(_ context.Context, _ linker.LinkConfig) error { return nil }
+	cleanFunc = func(_ context.Context, _ linker.LinkConfig) (*linker.CleanResult, error) {
+		return &linker.CleanResult{}, nil
+	}
 
 	out, err := runWithDotfiles(t, makeDotfiles(t), "clean")
 	if err != nil {
@@ -702,7 +740,9 @@ func TestCleanCmd_Success(t *testing.T) {
 func TestCleanCmd_DryRun(t *testing.T) {
 	orig := cleanFunc
 	t.Cleanup(func() { cleanFunc = orig })
-	cleanFunc = func(_ context.Context, _ linker.LinkConfig) error { return nil }
+	cleanFunc = func(_ context.Context, _ linker.LinkConfig) (*linker.CleanResult, error) {
+		return &linker.CleanResult{}, nil
+	}
 
 	out, err := runWithDotfiles(t, makeDotfiles(t), "--dry-run", "clean")
 	if err != nil {
@@ -716,13 +756,29 @@ func TestCleanCmd_DryRun(t *testing.T) {
 func TestCleanCmd_Error(t *testing.T) {
 	orig := cleanFunc
 	t.Cleanup(func() { cleanFunc = orig })
-	cleanFunc = func(_ context.Context, _ linker.LinkConfig) error {
-		return fmt.Errorf("forced clean error")
+	cleanFunc = func(_ context.Context, _ linker.LinkConfig) (*linker.CleanResult, error) {
+		return nil, fmt.Errorf("forced clean error")
 	}
 
 	_, err := runWithDotfiles(t, makeDotfiles(t), "clean")
 	if err == nil {
 		t.Fatal("expected error from cleanFunc, got nil")
+	}
+}
+
+func TestCleanCmd_WarnsDisowned(t *testing.T) {
+	orig := cleanFunc
+	t.Cleanup(func() { cleanFunc = orig })
+	cleanFunc = func(_ context.Context, _ linker.LinkConfig) (*linker.CleanResult, error) {
+		return &linker.CleanResult{Disowned: []string{".bashrc"}}, nil
+	}
+
+	out, err := runWithDotfiles(t, makeDotfiles(t), "clean")
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if !strings.Contains(out, "no longer dotsmith-managed") || !strings.Contains(out, ".bashrc") {
+		t.Errorf("clean output = %q, want disown warning mentioning .bashrc", out)
 	}
 }
 
@@ -1299,6 +1355,130 @@ func TestCompiledFileRefs_SkipsStateFile(t *testing.T) {
 	}
 	if len(refs) != 1 || refs[0].RelPath != ".bashrc" {
 		t.Errorf("refs = %v, want [{.bashrc ...}]", refs)
+	}
+}
+
+// stubWriteWithDangling makes writeCompiledFunc report a dangling set so the
+// CLI warning path can be exercised without staging a full prune on disk.
+func stubWriteWithDangling(t *testing.T, dangling []string) {
+	t.Helper()
+	orig := writeCompiledFunc
+	t.Cleanup(func() { writeCompiledFunc = orig })
+	writeCompiledFunc = func(_ context.Context, _ *compiler.CompileResult, _ compiler.WriteConfig) (compiler.WriteStats, error) {
+		return compiler.WriteStats{
+			Pruned:   dangling,
+			Dangling: dangling,
+		}, nil
+	}
+}
+
+// TestCompileCmd_DanglingWarning asserts a bare compile prints the
+// dangling-symlink warning, lists the paths, and advises running link.
+func TestCompileCmd_DanglingWarning(t *testing.T) {
+	stubWriteWithDangling(t, []string{".vimrc"})
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "x\n")
+
+	out, err := runWithDotfiles(t, root, "compile")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !strings.Contains(out, "dangle") {
+		t.Errorf("expected dangling warning, got: %q", out)
+	}
+	if !strings.Contains(out, ".vimrc") {
+		t.Errorf("expected dangling path listed, got: %q", out)
+	}
+	if !strings.Contains(out, "dotsmith link") {
+		t.Errorf("expected advice to run link, got: %q", out)
+	}
+}
+
+// TestCompileCmd_NoDanglingWarningWhenNone asserts no warning is printed when
+// nothing dangles.
+func TestCompileCmd_NoDanglingWarningWhenNone(t *testing.T) {
+	stubWriteWithDangling(t, nil)
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "x\n")
+
+	out, err := runWithDotfiles(t, root, "compile")
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if strings.Contains(out, "dangle") {
+		t.Errorf("did not expect dangling warning, got: %q", out)
+	}
+}
+
+// TestApplyCmd_SuppressesDanglingWarning asserts apply does not print the
+// dangling warning even when files were pruned, since it links immediately after.
+func TestApplyCmd_SuppressesDanglingWarning(t *testing.T) {
+	stubWriteWithDangling(t, []string{".vimrc"})
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "x\n")
+	compileDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	out, err := run(t, "--dotfiles-dir", root, "apply",
+		"--compile-dir", compileDir, "--target-dir", targetDir)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if strings.Contains(out, "dangle") {
+		t.Errorf("apply should suppress dangling warning, got: %q", out)
+	}
+}
+
+// TestPrintDanglingWarning_CapsLongList asserts the warning caps the listed
+// paths and summarises the remainder when the list is long.
+func TestPrintDanglingWarning_CapsLongList(t *testing.T) {
+	var dangling []string
+	for i := 0; i < danglingWarnCap+5; i++ {
+		dangling = append(dangling, fmt.Sprintf(".f%d", i))
+	}
+	var buf bytes.Buffer
+	printDanglingWarning(&buf, dangling)
+	out := buf.String()
+	if !strings.Contains(out, "... and 5 more") {
+		t.Errorf("expected capped summary, got: %q", out)
+	}
+	// The first capped entries are listed; entries past the cap are not listed
+	// individually.
+	if !strings.Contains(out, ".f0") {
+		t.Errorf("expected first entry listed, got: %q", out)
+	}
+	if strings.Contains(out, fmt.Sprintf(".f%d\n", danglingWarnCap+4)) {
+		t.Errorf("entry past the cap should not be listed individually, got: %q", out)
+	}
+}
+
+// TestWarnDisowned_Empty asserts no output is written when nothing was disowned.
+func TestWarnDisowned_Empty(t *testing.T) {
+	var buf bytes.Buffer
+	warnDisowned(&buf, nil)
+	if buf.Len() != 0 {
+		t.Errorf("expected no output for empty disowned list, got: %q", buf.String())
+	}
+}
+
+// TestWarnDisowned_CapsLongList asserts the warning caps the listed paths and
+// summarises the remainder when the list is long.
+func TestWarnDisowned_CapsLongList(t *testing.T) {
+	var disowned []string
+	for i := 0; i < danglingWarnCap+5; i++ {
+		disowned = append(disowned, fmt.Sprintf(".f%d", i))
+	}
+	var buf bytes.Buffer
+	warnDisowned(&buf, disowned)
+	out := buf.String()
+	if !strings.Contains(out, "... and 5 more") {
+		t.Errorf("expected capped summary, got: %q", out)
+	}
+	if !strings.Contains(out, ".f0") {
+		t.Errorf("expected first entry listed, got: %q", out)
+	}
+	if strings.Contains(out, fmt.Sprintf(".f%d\n", danglingWarnCap+4)) {
+		t.Errorf("entry past the cap should not be listed individually, got: %q", out)
 	}
 }
 

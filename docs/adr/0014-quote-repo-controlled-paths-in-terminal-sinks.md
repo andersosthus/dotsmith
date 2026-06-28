@@ -1,0 +1,18 @@
+# Render repo-controlled `.age` paths with `%q` in terminal output sinks
+
+A `.age` source file's path is rendered to the terminal in two places, and both now use `%q` (Go-quoted) instead of `%s`: the SSH-passphrase prompt notice in `encryptedSSHIdentity` (`internal/encrypt/resolve.go`) — `dotsmith: decrypting %q requires SSH key %q` — and the `--dry-run` report lines in `printDryRunReports` (`internal/cli/helpers.go`) — `would decrypt %q -> %q [%s]` and `would NOT decrypt %q -> ...`. The path comes from `SubfileDesc.SourcePath`, whose basename is fully repo-controlled: a Unix filename may contain any byte except `/` and NUL, including ANSI escapes, carriage returns, and newlines. Quoting renders those bytes in their escaped (`\x1b`, `\r`, `\n`) form so a crafted filename cannot manipulate or spoof the terminal.
+
+This is **a terminal-output-injection fix (severity LOW)**, not a credential-disclosure fix. The concrete scenario is a `.age` subfile whose basename embeds an ANSI clear-line plus a forged `Enter passphrase for …` line; printed unsanitized right before the genuine passphrase prompt it strengthens a social-engineering scenario. dotsmith's real prompt label still cannot be forged, the passphrase is read and consumed locally with no exfiltration channel, and the effect is confined to the victim's own terminal — so no credential is captured. The fix removes the spoofing surface rather than mitigating a key leak.
+
+## Considered Options
+
+- **Quote repo-controlled paths with `%q` at the print site (chosen)** — `%q` escapes every control byte while leaving ordinary paths human-readable (just wrapped in quotes), is a one-token change at each sink, and keeps the path verbatim in the message so the operator still sees exactly which file is involved. Applied uniformly to both the prompt notice and the dry-run lines, which are the only sinks that echo a repo-controlled path to a terminal.
+- **Strip or replace non-printable bytes before printing** — rejected: lossy and ambiguous (two distinct filenames could render identically), and it invents a sanitization scheme where the standard library already has an unambiguous, reversible one in `%q`.
+- **Validate `.age` basenames and reject control characters at discovery time** — rejected as the fix for *this* issue: it is a broader policy change to the compiler's accepted filename set, would reject names that are legal on the filesystem, and still would not cover any future sink that prints a path. Quoting at the sink fails closed regardless of what the compiler accepts.
+- **Do nothing** — rejected: the change is trivial, and an unsanitized repo-controlled string written to a terminal immediately before a passphrase prompt is exactly the kind of avoidable spoofing surface worth closing even at LOW severity.
+
+## Consequences
+
+- Both terminal sinks now quote the repo path: a basename containing escapes, CRs, or newlines is emitted in its `%q`-escaped form, so it stays on a single line and cannot emit raw terminal-control sequences. Ordinary paths are unchanged except for the surrounding quotes.
+- `%q` is the project's standard for any future code that prints a repo-controlled path to a terminal; new sinks that echo such a path should follow this rather than `%s`. The identity-key path in the prompt notice is quoted too, for consistency, though it is operator-supplied rather than repo-controlled.
+- The dry-run probe's matching behaviour (ADR 0004) is untouched — only the rendering of the already-computed report changes. `render` and `decrypt` still emit no such reports.

@@ -90,14 +90,14 @@ How each shell loads completions:
 | Command | Description |
 |---------|-------------|
 | `init` | Scaffold a new dotfiles repository structure |
-| `compile` | Discover, decrypt, and assemble dotfiles into the compile directory |
+| `compile` | Discover, decrypt, and assemble dotfiles into the compile directory; prune compiled files whose source no longer exists |
 | `link` | Create symlinks from the compile directory to the target directory |
 | `apply` | Compile dotfiles and link them to the target directory (compile + link) |
 | `render <relpath>` | Compile a single dotfile and print it to stdout |
 | `decrypt <file.age>` | Decrypt an age-encrypted file and print it to stdout |
 | `status` | Report the status of managed symlinks |
 | `identity` | Print the resolved OS, hostname, username, and user@host |
-| `clean` | Remove managed symlinks and compiled files |
+| `clean` | Remove managed symlinks and every compiled file dotsmith produced, emptying the compile directory |
 | `git install` | Append dotsmith hook to `post-merge` and `post-checkout`; `--branch <name>` restricts the hook to that branch |
 | `git remove` | Remove dotsmith hook from `post-merge` and `post-checkout` |
 | `shell <bash\|zsh\|fish>` | Generate shell completion script |
@@ -161,6 +161,63 @@ into the target directory (`~` by default):
 ~/.profile  →  ~/.dotcompiled/.profile
 ~/.config/git/config  →  ~/.dotcompiled/.config/git/config
 ```
+
+### Pruning
+
+`compile` owns the compile directory. It records every file it produces in a
+manifest inside the state file (`.dotsmith.state`), and on each run it prunes any
+compiled file that the manifest lists but the current compile no longer produces
+— i.e. whose source was removed from your dotfiles repo. Pruning is scoped
+strictly to the compile directory (dotsmith only deletes files it created itself)
+and removes any parent directories left empty. The compile output line reports
+the count: `compiled: N written, M unchanged, P pruned`.
+
+When a pruned file still has a symlink pointing at it, that symlink is left
+dangling until the next `link`. A bare `compile` prints a warning listing the
+affected symlinks (capped, with a count of any remainder) and advising
+`dotsmith link`. `apply` does not print this warning: it runs `link` immediately
+after compiling, so the dangling symlinks are resolved before it returns.
+
+`--dry-run` reports the same pruned and dangling sets without writing, removing,
+or saving anything.
+
+### Disowned paths
+
+Before `link` removes an orphaned symlink, or `clean` removes a managed symlink,
+it verifies the target really is the symlink dotsmith created: it must be a
+symlink that still resolves to the expected compiled source. If the target is
+something else — most often because you replaced the symlink with a real file of
+your own — dotsmith *disowns* the path instead of deleting it. Your file is left
+untouched, but dotsmith stops tracking the path: it removes its own compiled
+artifact and drops the state entry, so it does not warn about the same path on
+every run.
+
+`link`, `clean`, and `apply` print a warning on stderr listing any disowned
+paths (capped, with a count of any remainder). A correctly managed symlink is
+still removed as before.
+
+The same protection extends to **symlinked parent directories**. If a target's
+parent is itself a symlink you created — for example `~/.config` pointing at a
+cloud-synced location — dotsmith refuses to plant a managed link inside it:
+`link` reports a conflict and tells you to replace the symlink with a real
+directory or move the target out from under it. And when cleaning up empty
+directories after a removal, the climb stops at the first symlinked ancestor, so
+`clean` and orphan removal never unlink your symlinked parent dir. (The conflict
+fires in `--dry-run` too, so a dry run reports it without writing anything.)
+
+### Clean
+
+`clean` tears down everything dotsmith created. It removes every managed symlink
+(applying the disown guard above), then removes every compiled file recorded in
+the manifest — not just the ones that had a symlink, but also files that were
+compiled and never linked — so the compile directory is left holding no compiled
+files, only the state file. Now-empty parent directories within the compile
+directory are removed too. Finally it zeroes both state fields (the symlink
+records and the compile manifest).
+
+Each manifest entry is re-validated as living inside the compile directory before
+removal, and an already-missing file is tolerated rather than treated as an
+error.
 
 ## Subfiles
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/andersosthus/dotsmith/internal/state"
@@ -48,6 +49,22 @@ func writeStateMulti(t *testing.T, compileDir string, entries map[string]string)
 	}
 }
 
+// writeStateWithManifest writes a state file with the given symlink entries and
+// compile manifest entries (relPath→hash for each).
+func writeStateWithManifest(t *testing.T, compileDir string, symlinks, compiled map[string]string) {
+	t.Helper()
+	s := state.New()
+	for relPath, hash := range symlinks {
+		s.Symlinks[relPath] = state.SymlinkEntry{Source: relPath, Target: relPath, ContentHash: hash}
+	}
+	for relPath, hash := range compiled {
+		s.Compiled[relPath] = state.CompiledEntry{ContentHash: hash}
+	}
+	if err := state.Save(context.Background(), s, compileDir); err != nil {
+		t.Fatalf("Save state: %v", err)
+	}
+}
+
 // writeCorruptState writes a file that is not valid JSON.
 func writeCorruptState(t *testing.T, compileDir string) {
 	t.Helper()
@@ -84,6 +101,17 @@ func injectReadlink(t *testing.T, fn func(string) (string, error)) {
 	orig := osReadlinkFunc
 	t.Cleanup(func() { osReadlinkFunc = orig })
 	osReadlinkFunc = fn
+}
+
+// makeDirs creates each given directory (and any parents), failing the test on
+// error.
+func makeDirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", d, err)
+		}
+	}
 }
 
 // ---- Link tests -------------------------------------------------------------
@@ -597,6 +625,216 @@ func TestLink_RemoveOrphan_Mixed(t *testing.T) {
 	}
 }
 
+// ---- verify-then-disown tests -----------------------------------------------
+
+// writeFile writes a plain regular file at dir/relPath.
+func writeFile(t *testing.T, dir, relPath, content string) {
+	t.Helper()
+	p := filepath.Join(dir, relPath)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// assertFileContent fails unless the file at path has exactly want.
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("file %s removed or unreadable: %v", path, err)
+	}
+	if string(got) != want {
+		t.Errorf("file %s content = %q, want %q", path, string(got), want)
+	}
+}
+
+// assertGone fails unless path does not exist.
+func assertGone(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be gone, lstat err = %v", path, err)
+	}
+}
+
+// assertNoStateEntry fails unless the state at compileDir has no entry for relPath.
+func assertNoStateEntry(t *testing.T, compileDir, relPath string) {
+	t.Helper()
+	s, err := state.Load(context.Background(), compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if _, ok := s.Symlinks[relPath]; ok {
+		t.Errorf("expected %s dropped from state", relPath)
+	}
+}
+
+// TestLink_RemoveOrphan_DisownsReplacedFile verifies that when a managed
+// symlink's source is gone but the user has replaced the target with a real file
+// of their own, Link leaves the user's file untouched, removes the compiled
+// artifact, drops the state entry, and surfaces the disowned path.
+func TestLink_RemoveOrphan_DisownsReplacedFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "compiled\n")
+	// User replaced the managed symlink with a real file of their own.
+	writeFile(t, targetDir, ".bashrc", "my own content\n")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Removed != 0 {
+		t.Errorf("result.Removed = %d, want 0", result.Removed)
+	}
+	if len(result.Disowned) != 1 || result.Disowned[0] != ".bashrc" {
+		t.Errorf("result.Disowned = %v, want [.bashrc]", result.Disowned)
+	}
+
+	assertFileContent(t, filepath.Join(targetDir, ".bashrc"), "my own content\n")
+	assertGone(t, filepath.Join(compileDir, ".bashrc"))
+	assertNoStateEntry(t, compileDir, ".bashrc")
+}
+
+// TestLink_RemoveOrphan_DisownsForeignSymlink verifies that a target which is a
+// symlink pointing somewhere other than the expected compiled source is treated
+// as foreign and disowned (left untouched).
+func TestLink_RemoveOrphan_DisownsForeignSymlink(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "compiled\n")
+	// Target is a symlink the user created pointing elsewhere.
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(elsewhere, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(targetDir, ".bashrc")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	ctx := context.Background()
+	result, err := Link(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if len(result.Disowned) != 1 {
+		t.Fatalf("result.Disowned = %v, want one entry", result.Disowned)
+	}
+	// Foreign symlink left in place.
+	dst, err := os.Readlink(filepath.Join(targetDir, ".bashrc"))
+	if err != nil {
+		t.Fatalf("foreign symlink removed or unreadable: %v", err)
+	}
+	if dst != elsewhere {
+		t.Errorf("foreign symlink target = %q, want %q", dst, elsewhere)
+	}
+}
+
+// TestLink_RemoveOrphan_LstatError verifies an unexpected lstat error during
+// orphan removal is surfaced rather than silently disowning the path.
+func TestLink_RemoveOrphan_LstatError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectLstat(t, func(string) (os.FileInfo, error) {
+		return nil, fmt.Errorf("forced lstat error")
+	})
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err == nil {
+		t.Fatal("expected error from lstat during orphan removal, got nil")
+	}
+}
+
+// TestLink_RemoveOrphan_ReadlinkError verifies an unexpected readlink error
+// during orphan removal is surfaced rather than silently disowning the path.
+func TestLink_RemoveOrphan_ReadlinkError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectReadlink(t, func(string) (string, error) {
+		return "", fmt.Errorf("forced readlink error")
+	})
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}, []FileRef{})
+	if err == nil {
+		t.Fatal("expected error from readlink during orphan removal, got nil")
+	}
+}
+
+// TestClean_DisownsReplacedFile verifies Clean leaves a user-substituted real
+// file untouched, removes the compiled artifact, and reports the disowned path.
+func TestClean_DisownsReplacedFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "compiled\n")
+	writeFile(t, targetDir, ".bashrc", "my own content\n")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	ctx := context.Background()
+	result, err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+	if len(result.Disowned) != 1 || result.Disowned[0] != ".bashrc" {
+		t.Errorf("result.Disowned = %v, want [.bashrc]", result.Disowned)
+	}
+	got, err := os.ReadFile(filepath.Join(targetDir, ".bashrc"))
+	if err != nil {
+		t.Fatalf("user file was removed or unreadable: %v", err)
+	}
+	if string(got) != "my own content\n" {
+		t.Errorf("user file content = %q, want unchanged", string(got))
+	}
+	if _, statErr := os.Lstat(filepath.Join(compileDir, ".bashrc")); !os.IsNotExist(statErr) {
+		t.Error("expected compiled artifact to be removed")
+	}
+}
+
+// TestClean_LstatError verifies an unexpected lstat error during clean is
+// surfaced rather than silently disowning the path.
+func TestClean_LstatError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectLstat(t, func(string) (os.FileInfo, error) {
+		return nil, fmt.Errorf("forced lstat error")
+	})
+
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err == nil {
+		t.Fatal("expected error from lstat during clean, got nil")
+	}
+}
+
+// TestClean_ReadlinkError verifies an unexpected readlink error during clean is
+// surfaced rather than silently disowning the path.
+func TestClean_ReadlinkError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeState(t, compileDir, ".bashrc", "somehash")
+
+	injectReadlink(t, func(string) (string, error) {
+		return "", fmt.Errorf("forced readlink error")
+	})
+
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err == nil {
+		t.Fatal("expected error from readlink during clean, got nil")
+	}
+}
+
 // ---- Status tests -----------------------------------------------------------
 
 func TestStatus_Empty(t *testing.T) {
@@ -774,7 +1012,7 @@ func TestClean_Basic(t *testing.T) {
 	writeState(t, compileDir, ".bashrc", "somehash")
 
 	ctx := context.Background()
-	if err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -802,7 +1040,7 @@ func TestClean_DryRun(t *testing.T) {
 	makeSymlink(t, compileDir, targetDir, ".bashrc")
 	writeState(t, compileDir, ".bashrc", "somehash")
 
-	if err := Clean(context.Background(),
+	if _, err := Clean(context.Background(),
 		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true}); err != nil {
 		t.Fatalf("Clean dry-run: %v", err)
 	}
@@ -819,7 +1057,7 @@ func TestClean_NestedPathEmptyDirRemoval(t *testing.T) {
 	makeSymlink(t, compileDir, targetDir, ".config/git/config")
 	writeState(t, compileDir, ".config/git/config", "somehash")
 
-	if err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -846,7 +1084,7 @@ func TestClean_NonEmptyDirPreserved(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean: %v", err)
 	}
 
@@ -856,13 +1094,136 @@ func TestClean_NonEmptyDirPreserved(t *testing.T) {
 	}
 }
 
+// TestClean_RemovesUnlinkedCompiledFile verifies that a compiled file recorded
+// in the manifest but never linked (no symlink entry) is removed by clean, and
+// that both state fields are zeroed afterwards.
+func TestClean_RemovesUnlinkedCompiledFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	// .bashrc is linked; .vimrc was compiled but never linked.
+	hashBash := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	hashVim := writeCompiled(t, compileDir, ".vimrc", "set noswap\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	writeStateWithManifest(t, compileDir,
+		map[string]string{".bashrc": hashBash},
+		map[string]string{".bashrc": hashBash, ".vimrc": hashVim})
+
+	ctx := context.Background()
+	if _, err := Clean(ctx, LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+
+	// Both compiled files must be gone — including the never-linked .vimrc.
+	assertGone(t, filepath.Join(compileDir, ".bashrc"))
+	assertGone(t, filepath.Join(compileDir, ".vimrc"))
+	// The linked symlink must be gone.
+	assertGone(t, filepath.Join(targetDir, ".bashrc"))
+
+	// Both state fields must be zeroed.
+	s, err := state.Load(ctx, compileDir)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	if len(s.Symlinks) != 0 {
+		t.Errorf("Symlinks has %d entries after clean, want 0", len(s.Symlinks))
+	}
+	if len(s.Compiled) != 0 {
+		t.Errorf("Compiled has %d entries after clean, want 0", len(s.Compiled))
+	}
+}
+
+// TestClean_RemovesUnlinkedNestedCompiledFile verifies that a never-linked
+// compiled file in a nested path is removed and its now-empty parent
+// directories within the compile directory are cleaned up.
+func TestClean_RemovesUnlinkedNestedCompiledFile(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compileDir, ".config/nvim/init.lua", "vim.opt\n")
+	writeStateWithManifest(t, compileDir,
+		nil,
+		map[string]string{".config/nvim/init.lua": hash})
+
+	if _, err := Clean(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+
+	assertGone(t, filepath.Join(compileDir, ".config", "nvim", "init.lua"))
+	assertGone(t, filepath.Join(compileDir, ".config", "nvim"))
+	assertGone(t, filepath.Join(compileDir, ".config"))
+}
+
+// TestClean_UnlinkedCompiledAlreadyGone verifies a manifest entry whose compiled
+// file is already absent does not cause an error.
+func TestClean_UnlinkedCompiledAlreadyGone(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeStateWithManifest(t, compileDir,
+		nil,
+		map[string]string{".vimrc": "somehash"})
+
+	if _, err := Clean(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+		t.Fatalf("Clean with already-gone compiled file: %v", err)
+	}
+}
+
+// TestClean_UnlinkedCompiledRemoveError verifies an os.Remove failure while
+// removing a never-linked compiled file is surfaced.
+func TestClean_UnlinkedCompiledRemoveError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	writeCompiled(t, compileDir, ".vimrc", "set noswap\n")
+	writeStateWithManifest(t, compileDir,
+		nil,
+		map[string]string{".vimrc": "somehash"})
+
+	orig := osRemoveFunc
+	t.Cleanup(func() { osRemoveFunc = orig })
+	osRemoveFunc = func(path string) error {
+		if filepath.Base(path) == ".vimrc" {
+			return fmt.Errorf("forced remove error")
+		}
+		return orig(path)
+	}
+
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	if err == nil {
+		t.Fatal("expected error removing unlinked compiled file, got nil")
+	}
+}
+
+// TestCleanCompiled_NonLocalManifest_Refused verifies cleanCompiled refuses a
+// manifest key that escapes the compile directory and performs no out-of-tree
+// deletion. state.Load already rejects such a key, so this exercises the
+// belt-and-suspenders guard at the deletion sink directly.
+func TestCleanCompiled_NonLocalManifest_Refused(t *testing.T) {
+	compileDir := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+
+	rel, err := filepath.Rel(compileDir, victim)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	s := state.New()
+	s.Compiled[rel] = state.CompiledEntry{ContentHash: "h"}
+
+	cfg := LinkConfig{CompileDir: compileDir, TargetDir: t.TempDir()}
+	if err := cleanCompiled(cfg, s, map[string]struct{}{}); err == nil {
+		t.Fatal("expected cleanCompiled to refuse non-local manifest key, got nil")
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Fatalf("victim file was deleted or unreadable: %v", statErr)
+	}
+}
+
 func TestClean_AlreadyGone(t *testing.T) {
 	// Files already removed from disk should not cause errors.
 	compileDir, targetDir := t.TempDir(), t.TempDir()
 	writeState(t, compileDir, ".bashrc", "somehash")
 	// No symlink or compiled file created.
 
-	if err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
+	if _, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir}); err != nil {
 		t.Fatalf("Clean with already-gone files: %v", err)
 	}
 }
@@ -871,7 +1232,7 @@ func TestClean_LoadStateError(t *testing.T) {
 	compileDir := t.TempDir()
 	writeCorruptState(t, compileDir)
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: t.TempDir()})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: t.TempDir()})
 	if err == nil {
 		t.Fatal("expected error from corrupt state, got nil")
 	}
@@ -892,7 +1253,7 @@ func TestClean_SaveStateError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(compileDir, 0o755) })
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
 	if err == nil {
 		t.Fatal("expected error saving state, got nil")
 	}
@@ -914,7 +1275,7 @@ func TestClean_RemoveSymlinkError(t *testing.T) {
 		return orig(path)
 	}
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
 	if err == nil {
 		t.Fatal("expected error removing symlink, got nil")
 	}
@@ -936,46 +1297,13 @@ func TestClean_RemoveSourceError(t *testing.T) {
 		return orig(path)
 	}
 
-	err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
+	_, err := Clean(context.Background(), LinkConfig{CompileDir: compileDir, TargetDir: targetDir})
 	if err == nil {
 		t.Fatal("expected error removing compiled file, got nil")
 	}
 }
 
 // ---- containment guard tests ------------------------------------------------
-
-// TestSafeJoin verifies safeJoin accepts local paths and refuses non-local ones.
-func TestSafeJoin(t *testing.T) {
-	base := t.TempDir()
-	tests := []struct {
-		name    string
-		rel     string
-		wantErr bool
-	}{
-		{name: "simple local", rel: ".bashrc", wantErr: false},
-		{name: "nested local", rel: filepath.Join("a", "b", "c"), wantErr: false},
-		{name: "parent escape", rel: filepath.Join("..", "evil"), wantErr: true},
-		{name: "deep parent escape", rel: filepath.Join("a", "..", "..", "evil"), wantErr: true},
-		{name: "absolute path", rel: "/etc/passwd", wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := safeJoin(base, tt.rel)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("safeJoin(%q, %q) = %q, want error", base, tt.rel, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("safeJoin(%q, %q) unexpected error: %v", base, tt.rel, err)
-			}
-			if got != filepath.Join(base, tt.rel) {
-				t.Errorf("safeJoin = %q, want %q", got, filepath.Join(base, tt.rel))
-			}
-		})
-	}
-}
 
 // nonLocalState builds a State whose single entry escapes its directory. It
 // bypasses state.Load (which would reject such an entry) to simulate a future
@@ -1061,7 +1389,7 @@ func TestCleanSymlinks_NonLocalTarget_Refused(t *testing.T) {
 	s := nonLocalState(rel)
 
 	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
-	if err := cleanSymlinks(cfg, s); err == nil {
+	if _, err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
 		t.Fatal("expected cleanSymlinks to refuse non-local target, got nil")
 	}
 	if _, statErr := os.Stat(victim); statErr != nil {
@@ -1088,7 +1416,7 @@ func TestCleanSymlinks_NonLocalSource_Refused(t *testing.T) {
 	s.Symlinks["evil"] = state.SymlinkEntry{Source: rel, Target: ".bashrc", ContentHash: "h"}
 
 	cfg := LinkConfig{CompileDir: compileDir, TargetDir: targetDir}
-	if err := cleanSymlinks(cfg, s); err == nil {
+	if _, err := cleanSymlinks(cfg, s, &CleanResult{}); err == nil {
 		t.Fatal("expected cleanSymlinks to refuse non-local source, got nil")
 	}
 	if _, statErr := os.Stat(victim); statErr != nil {
@@ -1108,8 +1436,229 @@ func TestHashBytes_Deterministic(t *testing.T) {
 	if h1 == h3 {
 		t.Error("different inputs should produce different hashes")
 	}
-	if len(h1) != 64 {
-		t.Errorf("hash length = %d, want 64", len(h1))
+	if len(h1) != 32 {
+		t.Errorf("hash length = %d, want 32 (hex XXH3-128)", len(h1))
+	}
+}
+
+// ---- symlinked-parent safety tests -----------------------------------------
+
+// TestClean_PreservesSymlinkedParent is the end-to-end reproduction from issue
+// #41: a user's non-managed symlinked parent dir (e.g. ~/.config -> a
+// cloud-synced location) must survive Clean's empty-parent cleanup. Without the
+// guard, os.Remove unlinks the symlink itself rather than rmdir'ing its
+// (non-empty) target, silently deleting the user's link.
+//
+// To reproduce the exact climb the bug exercises, the managed link is planted
+// directly inside the symlinked directory and recorded in state, bypassing
+// linkNew's new guard (which now refuses to create such a link in the first
+// place). This isolates the RemoveEmptyParents behaviour against the real Clean.
+func TestClean_PreservesSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	if err := os.WriteFile(filepath.Join(real, "precious.txt"), []byte("data\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile precious: %v", err)
+	}
+	// The user's NON-managed symlinked parent dir under target.
+	link := filepath.Join(target, ".config")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	// A compiled source and a managed leaf planted inside the symlinked dir,
+	// recorded in state as Target=.config/app.conf.
+	hash := writeCompiled(t, compile, ".config/app.conf", "managed\n")
+	if err := os.Symlink(filepath.Join(compile, ".config/app.conf"),
+		filepath.Join(real, "app.conf")); err != nil {
+		t.Fatalf("Symlink leaf: %v", err)
+	}
+	writeState(t, compile, ".config/app.conf", hash)
+
+	if _, err := Clean(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target}); err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+
+	// The user's symlink must still exist and still be a symlink.
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("user symlink %s was deleted: %v", link, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("expected %s to remain a symlink", link)
+	}
+	// The data behind it must remain.
+	if _, err := os.Stat(filepath.Join(real, "precious.txt")); err != nil {
+		t.Errorf("data behind symlink was lost: %v", err)
+	}
+}
+
+// TestLink_RefusesSymlinkedParent verifies linkNew treats a symlinked parent
+// component as a conflict, refusing to plant a managed link inside a user's
+// symlinked directory and leaving the symlink and its contents untouched.
+func TestLink_RefusesSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	link := filepath.Join(target, ".config")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked parent, got nil")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("error %q should explain the symlinked-parent conflict", err.Error())
+	}
+	// No managed link must have been planted inside the symlinked dir.
+	if _, statErr := os.Lstat(filepath.Join(real, "app.conf")); !os.IsNotExist(statErr) {
+		t.Error("expected no managed link planted inside the symlinked dir")
+	}
+	// The user's symlink survives.
+	if _, statErr := os.Lstat(link); statErr != nil {
+		t.Errorf("user symlink was disturbed: %v", statErr)
+	}
+}
+
+// TestLink_RefusesSymlinkedParent_Nested verifies the guard inspects every
+// ancestor between TargetDir and the leaf, not just the immediate parent.
+func TestLink_RefusesSymlinkedParent_Nested(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	// Symlink a higher ancestor (.config), with a deeper real path below it.
+	if err := os.Symlink(real, filepath.Join(target, ".config")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app/sub.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app/sub.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked ancestor, got nil")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("error %q should explain the symlinked-parent conflict", err.Error())
+	}
+}
+
+// TestLink_RefusesSymlinkedParent_DryRun verifies the guard fires even in dry
+// run, so a dry run faithfully reports the conflict it would hit.
+func TestLink_RefusesSymlinkedParent_DryRun(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	if err := os.Symlink(real, filepath.Join(target, ".config")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target, DryRun: true},
+		[]FileRef{{RelPath: ".config/app.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked parent in dry run, got nil")
+	}
+}
+
+// TestLink_RealNestedParent_NoConflict verifies the guard does not fire for an
+// ordinary nested target whose parents are real directories (or do not exist
+// yet), so normal nested linking is unaffected.
+func TestLink_RealNestedParent_NoConflict(t *testing.T) {
+	compile, target := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compile, ".config/app/sub.conf", "data\n")
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app/sub.conf", ContentHash: hash}})
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if result.Created != 1 {
+		t.Errorf("result = %+v, want Created=1", result)
+	}
+}
+
+// TestLink_SymlinkedParentGuard_LstatError verifies an unexpected lstat error on
+// a parent component (other than not-exist) is surfaced rather than swallowed.
+func TestLink_SymlinkedParentGuard_LstatError(t *testing.T) {
+	compile, target := t.TempDir(), t.TempDir()
+	hash := writeCompiled(t, compile, ".config/app.conf", "data\n")
+	parent := filepath.Join(target, ".config")
+	injectLstat(t, func(p string) (os.FileInfo, error) {
+		if p == parent {
+			return nil, fmt.Errorf("forced lstat error")
+		}
+		return os.Lstat(p)
+	})
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected error from parent lstat, got nil")
+	}
+}
+
+// TestGuardSymlinkedParents_RootBackstop verifies the climb halts at the
+// filesystem root when targetDir is never an ancestor of the target, exercising
+// the dir == filepath.Dir(dir) backstop. Lstat is stubbed to report every
+// component as a non-existent real path so the walk runs to the root
+// deterministically, independent of the host filesystem layout.
+func TestGuardSymlinkedParents_RootBackstop(t *testing.T) {
+	injectLstat(t, func(string) (os.FileInfo, error) { return nil, os.ErrNotExist })
+	// targetDir is never an ancestor of the target path, so the loop walks up to
+	// the filesystem root and stops at the backstop rather than at targetDir.
+	if err := guardSymlinkedParents(
+		filepath.Join("never", "an", "ancestor"),
+		filepath.Join("a", "b", "c"),
+	); err != nil {
+		t.Fatalf("expected nil error at root backstop, got %v", err)
+	}
+}
+
+// TestLink_RealIntermediateThenSymlinkedAncestor verifies the guard climbs past
+// a real, existing intermediate directory before catching a symlinked ancestor
+// higher up, covering the multi-level real-then-symlink walk.
+func TestLink_RealIntermediateThenSymlinkedAncestor(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "home")
+	compile := filepath.Join(root, "compiled")
+	real := filepath.Join(root, "cloud")
+	makeDirs(t, target, compile, real)
+	// .config is a symlink; below it, a real "app" subdir exists in the target
+	// (created through the link so the immediate parent .config/app is a real,
+	// existing directory the climb walks past before reaching the .config symlink).
+	if err := os.Symlink(real, filepath.Join(target, ".config")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(real, "app"), 0o755); err != nil {
+		t.Fatalf("MkdirAll real/app: %v", err)
+	}
+	hash := writeCompiled(t, compile, ".config/app/sub.conf", "managed\n")
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target},
+		[]FileRef{{RelPath: ".config/app/sub.conf", ContentHash: hash}})
+	if err == nil {
+		t.Fatal("expected conflict error for symlinked ancestor, got nil")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("error %q should explain the symlinked-parent conflict", err.Error())
 	}
 }
 
@@ -1131,68 +1680,3 @@ func TestStateJSON_RoundTrip(t *testing.T) {
 	}
 }
 
-// ---- removeEmptyParents -----------------------------------------------------
-
-// TestRemoveEmptyParents verifies the climb-up stops at stopAt regardless of
-// non-canonical formatting (e.g. a trailing slash) on either path.
-func TestRemoveEmptyParents(t *testing.T) {
-	tests := []struct {
-		name string
-		// stopAtSuffix is appended to the cleaned stop directory to simulate
-		// non-canonical caller formatting (e.g. a trailing slash).
-		stopAtSuffix string
-		// dirSuffix is appended to the cleaned start directory.
-		dirSuffix string
-	}{
-		{name: "canonical stopAt", stopAtSuffix: "", dirSuffix: ""},
-		{name: "stopAt trailing slash", stopAtSuffix: "/", dirSuffix: ""},
-		{name: "dir trailing slash", stopAtSuffix: "", dirSuffix: "/"},
-		{name: "both trailing slash", stopAtSuffix: "/", dirSuffix: "/"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			root := t.TempDir()
-			// Layout: <root>/a/b/c — all empty below the stop point.
-			deep := filepath.Join(root, "a", "b", "c")
-			if err := os.MkdirAll(deep, 0o755); err != nil {
-				t.Fatalf("MkdirAll: %v", err)
-			}
-
-			removeEmptyParents(deep+tc.dirSuffix, root+tc.stopAtSuffix)
-
-			// The empty descendants of root must be gone.
-			if _, err := os.Stat(filepath.Join(root, "a")); !os.IsNotExist(err) {
-				t.Errorf("expected %s removed, stat err = %v", filepath.Join(root, "a"), err)
-			}
-			// stopAt itself (root) must survive.
-			if _, err := os.Stat(root); err != nil {
-				t.Errorf("expected stopAt %s to survive, stat err = %v", root, err)
-			}
-		})
-	}
-}
-
-// TestRemoveEmptyParents_StopsAtNonEmpty verifies the climb halts at the first
-// non-empty directory and leaves it (and the stop point) intact.
-func TestRemoveEmptyParents_StopsAtNonEmpty(t *testing.T) {
-	root := t.TempDir()
-	mid := filepath.Join(root, "a")
-	deep := filepath.Join(mid, "b")
-	if err := os.MkdirAll(deep, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	// Sibling file makes mid non-empty.
-	if err := os.WriteFile(filepath.Join(mid, "keep.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	removeEmptyParents(deep, root)
-
-	if _, err := os.Stat(deep); !os.IsNotExist(err) {
-		t.Errorf("expected %s removed, stat err = %v", deep, err)
-	}
-	if _, err := os.Stat(mid); err != nil {
-		t.Errorf("expected non-empty %s to survive, stat err = %v", mid, err)
-	}
-}

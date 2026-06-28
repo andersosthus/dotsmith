@@ -4,13 +4,13 @@ package linker
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/andersosthus/dotsmith/internal/hash"
+	"github.com/andersosthus/dotsmith/internal/safepath"
 	"github.com/andersosthus/dotsmith/internal/state"
 )
 
@@ -42,6 +42,19 @@ type LinkResult struct {
 	Unchanged int
 	// Removed is the number of orphaned symlinks and compiled files removed.
 	Removed int
+	// Disowned lists relative paths whose target was not a dotsmith-managed
+	// symlink (e.g. replaced by a real file of the user's). The user's file is
+	// left untouched while dotsmith forgets the path: its compiled artifact is
+	// removed and its state entry dropped. The CLI warns about these paths.
+	Disowned []string
+}
+
+// CleanResult reports what happened during a Clean call.
+type CleanResult struct {
+	// Disowned lists relative paths whose target was not a dotsmith-managed
+	// symlink and so was left untouched. The compiled artifact is still removed
+	// and the state entry dropped. The CLI warns about these paths.
+	Disowned []string
 }
 
 // StatusKind classifies the current state of a managed symlink.
@@ -117,25 +130,16 @@ func Link(ctx context.Context, cfg LinkConfig, files []FileRef) (*LinkResult, er
 	return result, nil
 }
 
-// safeJoin joins base and rel and confirms the result stays within base. It is
-// the belt-and-suspenders guard for every deletion sink: state.Load already
-// rejects non-local Source/Target paths, but any future producer of state
-// entries that bypasses Load must not be able to escape base and delete
-// arbitrary files. rel must be a local path (no leading "/" or ".." escape).
-func safeJoin(base, rel string) (string, error) {
-	if !filepath.IsLocal(rel) {
-		return "", fmt.Errorf(
-			"refusing non-local path %q under %s — entry escapes its directory",
-			rel, base,
-		)
-	}
-	return filepath.Join(base, rel), nil
-}
-
 // removeOrphans removes symlinks, compiled files, and state entries for paths
 // present in state but absent from currentFiles. The Source/Target paths are
 // re-validated as local before each os.Remove so a state entry that bypassed
 // state.Load's containment check cannot delete files outside TargetDir/CompileDir.
+//
+// Before deleting a target it verifies the target really is a dotsmith-managed
+// symlink (lstat + is-symlink + readlink resolves to the expected compiled
+// source). When it is not — e.g. the user replaced it with a real file — the
+// path is disowned: the user's file is left untouched, but the compiled artifact
+// is removed and the state entry dropped so dotsmith stops tracking it.
 func removeOrphans(
 	cfg LinkConfig,
 	s *state.State,
@@ -150,34 +154,104 @@ func removeOrphans(
 			r.Removed++
 			continue
 		}
-		if err := removeOrphanEntry(cfg, entry); err != nil {
+		disowned, err := removeOrphanEntry(cfg, entry)
+		if err != nil {
 			return err
 		}
 		delete(s.Symlinks, relPath)
-		r.Removed++
+		if disowned {
+			r.Disowned = append(r.Disowned, relPath)
+		} else {
+			r.Removed++
+		}
 	}
 	return nil
 }
 
+// targetKind classifies a target path at a deletion sink.
+type targetKind int
+
+const (
+	// targetManaged means the target is a dotsmith-managed symlink resolving to
+	// the expected compiled source and is safe to delete.
+	targetManaged targetKind = iota
+	// targetAbsent means the target does not exist; nothing to delete or disown.
+	targetAbsent
+	// targetForeign means the target exists but is not our symlink (a real file,
+	// or a symlink pointing elsewhere). The user's file must be left untouched
+	// and the path disowned.
+	targetForeign
+)
+
 // removeOrphanEntry deletes the symlink and compiled source file for a single
 // orphaned state entry. Both paths are re-validated as local before os.Remove.
-func removeOrphanEntry(cfg LinkConfig, entry state.SymlinkEntry) error {
-	targetPath, err := safeJoin(cfg.TargetDir, entry.Target)
+//
+// It returns disowned=true when the target exists but is not a dotsmith-managed
+// symlink and so was left in place; in that case only the compiled artifact is
+// removed.
+func removeOrphanEntry(cfg LinkConfig, entry state.SymlinkEntry) (bool, error) {
+	targetPath, err := safepath.Join(cfg.TargetDir, entry.Target)
 	if err != nil {
-		return fmt.Errorf("remove orphan symlink: %w", err)
+		return false, fmt.Errorf("remove orphan symlink: %w", err)
 	}
-	sourcePath, err := safeJoin(cfg.CompileDir, entry.Source)
+	sourcePath, err := safepath.Join(cfg.CompileDir, entry.Source)
 	if err != nil {
-		return fmt.Errorf("remove orphan compiled: %w", err)
+		return false, fmt.Errorf("remove orphan compiled: %w", err)
 	}
-	if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove orphan symlink %s: %w", targetPath, err)
+
+	kind, err := classifyTarget(targetPath, sourcePath)
+	if err != nil {
+		return false, fmt.Errorf("remove orphan symlink %s: %w", targetPath, err)
 	}
-	removeEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
+	if kind == targetManaged {
+		if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("remove orphan symlink %s: %w", targetPath, err)
+		}
+		safepath.RemoveEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
+	}
 	if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove orphan compiled %s: %w", sourcePath, err)
+		return false, fmt.Errorf("remove orphan compiled %s: %w", sourcePath, err)
 	}
-	return nil
+	return kind == targetForeign, nil
+}
+
+// classifyTarget inspects targetPath and classifies it for the deletion sinks.
+// It is the shared verify-then-disown predicate applied at both linker deletion
+// sinks (orphan removal during Link, and cleanSymlinks during Clean).
+//
+// It mirrors the linkExisting guard: lstat the path, confirm it is a symlink,
+// then readlink and compare the link's target string to expectedSource. The
+// comparison is on the stored target string, so it still holds after the
+// compiled source has been pruned from disk.
+//
+//   - A non-existent target is targetAbsent (already gone — a clean removal, not
+//     a conflict to warn about).
+//   - A regular file, or a symlink pointing elsewhere, is targetForeign and must
+//     be left untouched (disowned).
+//   - A symlink resolving to expectedSource is targetManaged and safe to delete.
+//
+// An unexpected lstat/readlink error (other than not-exist) is returned to the
+// caller rather than swallowed, so a transient failure never causes a silent
+// disown.
+func classifyTarget(targetPath, expectedSource string) (targetKind, error) {
+	fi, err := osLstatFunc(targetPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return targetAbsent, nil
+		}
+		return targetAbsent, fmt.Errorf("lstat %s: %w", targetPath, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return targetForeign, nil
+	}
+	existing, err := osReadlinkFunc(targetPath)
+	if err != nil {
+		return targetAbsent, fmt.Errorf("readlink %s: %w", targetPath, err)
+	}
+	if existing != expectedSource {
+		return targetForeign, nil
+	}
+	return targetManaged, nil
 }
 
 // linkFile processes a single FileRef within a Link call.
@@ -213,6 +287,9 @@ func linkOne(cfg LinkConfig, f FileRef, sourcePath, targetPath string, s *state.
 
 // linkNew creates a new symlink for a target that does not yet exist.
 func linkNew(cfg LinkConfig, f FileRef, sourcePath, targetPath string, s *state.State) (linkChange, error) {
+	if err := guardSymlinkedParents(cfg.TargetDir, targetPath); err != nil {
+		return linkUnchanged, err
+	}
 	if !cfg.DryRun {
 		if err := osMkdirAllFunc(filepath.Dir(targetPath), 0o755); err != nil {
 			return linkUnchanged, fmt.Errorf("create dir: %w", err)
@@ -225,6 +302,42 @@ func linkNew(cfg LinkConfig, f FileRef, sourcePath, targetPath string, s *state.
 		}
 	}
 	return linkCreated, nil
+}
+
+// guardSymlinkedParents refuses to create a managed link whose target sits below
+// a symlinked directory component between targetDir and the link's parent.
+//
+// os.MkdirAll silently follows a symlinked ancestor, planting the managed link
+// inside the directory the user's symlink points to (e.g. ~/.config pointing at a
+// cloud-synced location). That couples dotsmith's deletion sinks to a path the
+// user owns: subsequent orphan removal or clean would climb back through the
+// symlink. Treating a symlinked-dir ancestor as a conflict — mirroring
+// linkExisting's "exists and is not a symlink" guard — keeps managed links out of
+// user-owned symlinked directories in the first place. The leaf (targetPath) is
+// not inspected here: it is known absent (linkNew is the not-exist branch) and a
+// symlinked leaf is handled by linkExisting.
+func guardSymlinkedParents(targetDir, targetPath string) error {
+	targetDir = filepath.Clean(targetDir)
+	dir := filepath.Dir(targetPath)
+	for dir != targetDir && dir != filepath.Dir(dir) {
+		fi, err := osLstatFunc(dir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				dir = filepath.Dir(dir)
+				continue
+			}
+			return fmt.Errorf("stat parent %s: %w", dir, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf(
+				"conflict: parent %s is a symlink — refusing to plant a managed link inside it; "+
+					"replace the symlink with a real directory or move the target out from under it",
+				dir,
+			)
+		}
+		dir = filepath.Dir(dir)
+	}
+	return nil
 }
 
 // linkExisting handles a target path that already exists.
@@ -311,68 +424,127 @@ func statusOne(sourcePath, targetPath, stateHash string) StatusKind {
 }
 
 // Clean removes all managed symlinks, empty parent directories, and compiled
-// source files. In dry-run mode no changes are made.
-func Clean(ctx context.Context, cfg LinkConfig) error {
+// source files, then zeroes both state fields (Symlinks and Compiled). In
+// dry-run mode no changes are made.
+//
+// It removes every compiled file recorded in the manifest (state.Compiled), not
+// only those that had a symlink entry, so a file that was compiled but never
+// linked is also torn down and the compile directory is left holding no compiled
+// files (only the state file).
+//
+// A target that is no longer a dotsmith-managed symlink (lstat + is-symlink +
+// readlink resolves to the expected source) is left untouched; its compiled
+// artifact is still removed and it is reported in CleanResult.Disowned so the
+// CLI can warn that a substituted file was left in place.
+func Clean(ctx context.Context, cfg LinkConfig) (*CleanResult, error) {
 	s, err := state.Load(ctx, cfg.CompileDir)
 	if err != nil {
-		return fmt.Errorf("clean: load state: %w", err)
+		return nil, fmt.Errorf("clean: load state: %w", err)
 	}
 
+	result := &CleanResult{}
 	if !cfg.DryRun {
-		if err = cleanSymlinks(cfg, s); err != nil {
-			return err
+		removed, err := cleanSymlinks(cfg, s, result)
+		if err != nil {
+			return nil, err
+		}
+		if err = cleanCompiled(cfg, s, removed); err != nil {
+			return nil, err
 		}
 		s = state.New()
 		if err = state.Save(ctx, s, cfg.CompileDir); err != nil {
-			return fmt.Errorf("clean: save state: %w", err)
+			return nil, fmt.Errorf("clean: save state: %w", err)
 		}
 	}
-	return nil
+	return result, nil
 }
 
 // cleanSymlinks removes each managed symlink and its compiled source file. The
 // Source/Target paths are re-validated as local before each os.Remove so a state
 // entry that bypassed state.Load's containment check cannot delete files outside
 // TargetDir/CompileDir.
-func cleanSymlinks(cfg LinkConfig, s *state.State) error {
-	for _, entry := range s.Symlinks {
-		targetPath, err := safeJoin(cfg.TargetDir, entry.Target)
+//
+// Each target is verified as a dotsmith-managed symlink before removal. A target
+// that is not (e.g. replaced by a real file of the user's) is left untouched and
+// recorded in result.Disowned; its compiled artifact is still removed.
+//
+// It returns the set of compiled Source paths it removed so the manifest sweep
+// (cleanCompiled) can skip them and only delete compiled files that were never
+// linked.
+func cleanSymlinks(cfg LinkConfig, s *state.State, result *CleanResult) (map[string]struct{}, error) {
+	removed := make(map[string]struct{}, len(s.Symlinks))
+	for relPath, entry := range s.Symlinks {
+		disowned, err := cleanSymlinkEntry(cfg, entry)
 		if err != nil {
-			return fmt.Errorf("clean: remove symlink: %w", err)
+			return nil, err
 		}
-		sourcePath, err := safeJoin(cfg.CompileDir, entry.Source)
+		removed[entry.Source] = struct{}{}
+		if disowned {
+			result.Disowned = append(result.Disowned, relPath)
+		}
+	}
+	return removed, nil
+}
+
+// cleanCompiled removes every compiled file recorded in the manifest
+// (s.Compiled) that cleanSymlinks did not already remove. This is what lets
+// clean empty the compile directory of files that were compiled but never
+// linked — cleanSymlinks only reaches files with a corresponding symlink entry.
+//
+// Each manifest key is re-validated as local under CompileDir before os.Remove,
+// so a state file that bypassed state.Load's containment check cannot delete
+// files outside the compile directory. A missing file is not an error (it may
+// have already been pruned). After removal, now-empty parent directories within
+// the compile directory are cleaned up.
+func cleanCompiled(cfg LinkConfig, s *state.State, alreadyRemoved map[string]struct{}) error {
+	for relPath := range s.Compiled {
+		if _, done := alreadyRemoved[relPath]; done {
+			continue
+		}
+		sourcePath, err := safepath.Join(cfg.CompileDir, relPath)
 		if err != nil {
 			return fmt.Errorf("clean: remove compiled: %w", err)
 		}
-
-		if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("clean: remove symlink %s: %w", targetPath, err)
-		}
-		removeEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
 		if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("clean: remove compiled %s: %w", sourcePath, err)
 		}
+		safepath.RemoveEmptyParents(filepath.Dir(sourcePath), cfg.CompileDir)
 	}
 	return nil
 }
 
-// removeEmptyParents removes dir and its ancestors up to (but not including)
-// stopAt, stopping at the first non-empty directory. Both dir and stopAt are
-// cleaned before comparison so the stop point is honoured regardless of
-// trailing slashes or other non-canonical formatting in the caller's paths.
-func removeEmptyParents(dir, stopAt string) {
-	dir = filepath.Clean(dir)
-	stopAt = filepath.Clean(stopAt)
-	for dir != stopAt && dir != filepath.Dir(dir) {
-		if err := os.Remove(dir); err != nil {
-			return
-		}
-		dir = filepath.Dir(dir)
+// cleanSymlinkEntry removes the symlink and compiled source for a single managed
+// entry during Clean. Both paths are re-validated as local before os.Remove.
+//
+// It returns disowned=true when the target exists but is not a dotsmith-managed
+// symlink and so was left in place; the compiled artifact is removed regardless.
+func cleanSymlinkEntry(cfg LinkConfig, entry state.SymlinkEntry) (bool, error) {
+	targetPath, err := safepath.Join(cfg.TargetDir, entry.Target)
+	if err != nil {
+		return false, fmt.Errorf("clean: remove symlink: %w", err)
 	}
+	sourcePath, err := safepath.Join(cfg.CompileDir, entry.Source)
+	if err != nil {
+		return false, fmt.Errorf("clean: remove compiled: %w", err)
+	}
+
+	kind, err := classifyTarget(targetPath, sourcePath)
+	if err != nil {
+		return false, fmt.Errorf("clean: remove symlink %s: %w", targetPath, err)
+	}
+	if kind == targetManaged {
+		if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("clean: remove symlink %s: %w", targetPath, err)
+		}
+		safepath.RemoveEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
+	}
+	if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("clean: remove compiled %s: %w", sourcePath, err)
+	}
+	return kind == targetForeign, nil
 }
 
-// hashBytes returns the hex-encoded SHA-256 hash of data.
+// hashBytes returns the content digest of data via the shared hash helper.
 func hashBytes(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return hash.Sum(data)
 }
