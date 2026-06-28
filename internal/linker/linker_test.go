@@ -944,39 +944,6 @@ func TestClean_RemoveSourceError(t *testing.T) {
 
 // ---- containment guard tests ------------------------------------------------
 
-// TestSafeJoin verifies safeJoin accepts local paths and refuses non-local ones.
-func TestSafeJoin(t *testing.T) {
-	base := t.TempDir()
-	tests := []struct {
-		name    string
-		rel     string
-		wantErr bool
-	}{
-		{name: "simple local", rel: ".bashrc", wantErr: false},
-		{name: "nested local", rel: filepath.Join("a", "b", "c"), wantErr: false},
-		{name: "parent escape", rel: filepath.Join("..", "evil"), wantErr: true},
-		{name: "deep parent escape", rel: filepath.Join("a", "..", "..", "evil"), wantErr: true},
-		{name: "absolute path", rel: "/etc/passwd", wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := safeJoin(base, tt.rel)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("safeJoin(%q, %q) = %q, want error", base, tt.rel, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("safeJoin(%q, %q) unexpected error: %v", base, tt.rel, err)
-			}
-			if got != filepath.Join(base, tt.rel) {
-				t.Errorf("safeJoin = %q, want %q", got, filepath.Join(base, tt.rel))
-			}
-		})
-	}
-}
-
 // nonLocalState builds a State whose single entry escapes its directory. It
 // bypasses state.Load (which would reject such an entry) to simulate a future
 // producer that populates State without going through Load.
@@ -1131,68 +1098,3 @@ func TestStateJSON_RoundTrip(t *testing.T) {
 	}
 }
 
-// ---- removeEmptyParents -----------------------------------------------------
-
-// TestRemoveEmptyParents verifies the climb-up stops at stopAt regardless of
-// non-canonical formatting (e.g. a trailing slash) on either path.
-func TestRemoveEmptyParents(t *testing.T) {
-	tests := []struct {
-		name string
-		// stopAtSuffix is appended to the cleaned stop directory to simulate
-		// non-canonical caller formatting (e.g. a trailing slash).
-		stopAtSuffix string
-		// dirSuffix is appended to the cleaned start directory.
-		dirSuffix string
-	}{
-		{name: "canonical stopAt", stopAtSuffix: "", dirSuffix: ""},
-		{name: "stopAt trailing slash", stopAtSuffix: "/", dirSuffix: ""},
-		{name: "dir trailing slash", stopAtSuffix: "", dirSuffix: "/"},
-		{name: "both trailing slash", stopAtSuffix: "/", dirSuffix: "/"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			root := t.TempDir()
-			// Layout: <root>/a/b/c — all empty below the stop point.
-			deep := filepath.Join(root, "a", "b", "c")
-			if err := os.MkdirAll(deep, 0o755); err != nil {
-				t.Fatalf("MkdirAll: %v", err)
-			}
-
-			removeEmptyParents(deep+tc.dirSuffix, root+tc.stopAtSuffix)
-
-			// The empty descendants of root must be gone.
-			if _, err := os.Stat(filepath.Join(root, "a")); !os.IsNotExist(err) {
-				t.Errorf("expected %s removed, stat err = %v", filepath.Join(root, "a"), err)
-			}
-			// stopAt itself (root) must survive.
-			if _, err := os.Stat(root); err != nil {
-				t.Errorf("expected stopAt %s to survive, stat err = %v", root, err)
-			}
-		})
-	}
-}
-
-// TestRemoveEmptyParents_StopsAtNonEmpty verifies the climb halts at the first
-// non-empty directory and leaves it (and the stop point) intact.
-func TestRemoveEmptyParents_StopsAtNonEmpty(t *testing.T) {
-	root := t.TempDir()
-	mid := filepath.Join(root, "a")
-	deep := filepath.Join(mid, "b")
-	if err := os.MkdirAll(deep, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	// Sibling file makes mid non-empty.
-	if err := os.WriteFile(filepath.Join(mid, "keep.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	removeEmptyParents(deep, root)
-
-	if _, err := os.Stat(deep); !os.IsNotExist(err) {
-		t.Errorf("expected %s removed, stat err = %v", deep, err)
-	}
-	if _, err := os.Stat(mid); err != nil {
-		t.Errorf("expected non-empty %s to survive, stat err = %v", mid, err)
-	}
-}

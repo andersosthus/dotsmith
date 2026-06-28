@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/andersosthus/dotsmith/internal/hash"
+	"github.com/andersosthus/dotsmith/internal/safepath"
 	"github.com/andersosthus/dotsmith/internal/state"
 )
 
@@ -116,21 +117,6 @@ func Link(ctx context.Context, cfg LinkConfig, files []FileRef) (*LinkResult, er
 	return result, nil
 }
 
-// safeJoin joins base and rel and confirms the result stays within base. It is
-// the belt-and-suspenders guard for every deletion sink: state.Load already
-// rejects non-local Source/Target paths, but any future producer of state
-// entries that bypasses Load must not be able to escape base and delete
-// arbitrary files. rel must be a local path (no leading "/" or ".." escape).
-func safeJoin(base, rel string) (string, error) {
-	if !filepath.IsLocal(rel) {
-		return "", fmt.Errorf(
-			"refusing non-local path %q under %s — entry escapes its directory",
-			rel, base,
-		)
-	}
-	return filepath.Join(base, rel), nil
-}
-
 // removeOrphans removes symlinks, compiled files, and state entries for paths
 // present in state but absent from currentFiles. The Source/Target paths are
 // re-validated as local before each os.Remove so a state entry that bypassed
@@ -161,18 +147,18 @@ func removeOrphans(
 // removeOrphanEntry deletes the symlink and compiled source file for a single
 // orphaned state entry. Both paths are re-validated as local before os.Remove.
 func removeOrphanEntry(cfg LinkConfig, entry state.SymlinkEntry) error {
-	targetPath, err := safeJoin(cfg.TargetDir, entry.Target)
+	targetPath, err := safepath.Join(cfg.TargetDir, entry.Target)
 	if err != nil {
 		return fmt.Errorf("remove orphan symlink: %w", err)
 	}
-	sourcePath, err := safeJoin(cfg.CompileDir, entry.Source)
+	sourcePath, err := safepath.Join(cfg.CompileDir, entry.Source)
 	if err != nil {
 		return fmt.Errorf("remove orphan compiled: %w", err)
 	}
 	if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove orphan symlink %s: %w", targetPath, err)
 	}
-	removeEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
+	safepath.RemoveEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
 	if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove orphan compiled %s: %w", sourcePath, err)
 	}
@@ -335,11 +321,11 @@ func Clean(ctx context.Context, cfg LinkConfig) error {
 // TargetDir/CompileDir.
 func cleanSymlinks(cfg LinkConfig, s *state.State) error {
 	for _, entry := range s.Symlinks {
-		targetPath, err := safeJoin(cfg.TargetDir, entry.Target)
+		targetPath, err := safepath.Join(cfg.TargetDir, entry.Target)
 		if err != nil {
 			return fmt.Errorf("clean: remove symlink: %w", err)
 		}
-		sourcePath, err := safeJoin(cfg.CompileDir, entry.Source)
+		sourcePath, err := safepath.Join(cfg.CompileDir, entry.Source)
 		if err != nil {
 			return fmt.Errorf("clean: remove compiled: %w", err)
 		}
@@ -347,27 +333,12 @@ func cleanSymlinks(cfg LinkConfig, s *state.State) error {
 		if err := osRemoveFunc(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("clean: remove symlink %s: %w", targetPath, err)
 		}
-		removeEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
+		safepath.RemoveEmptyParents(filepath.Dir(targetPath), cfg.TargetDir)
 		if err := osRemoveFunc(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("clean: remove compiled %s: %w", sourcePath, err)
 		}
 	}
 	return nil
-}
-
-// removeEmptyParents removes dir and its ancestors up to (but not including)
-// stopAt, stopping at the first non-empty directory. Both dir and stopAt are
-// cleaned before comparison so the stop point is honoured regardless of
-// trailing slashes or other non-canonical formatting in the caller's paths.
-func removeEmptyParents(dir, stopAt string) {
-	dir = filepath.Clean(dir)
-	stopAt = filepath.Clean(stopAt)
-	for dir != stopAt && dir != filepath.Dir(dir) {
-		if err := os.Remove(dir); err != nil {
-			return
-		}
-		dir = filepath.Dir(dir)
-	}
 }
 
 // hashBytes returns the content digest of data via the shared hash helper.
