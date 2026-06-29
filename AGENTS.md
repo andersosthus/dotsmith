@@ -36,6 +36,24 @@ Keep packages small and focused. No `pkg/` or `util/` grab-bags.
 No other runtime dependencies unless strictly necessary. Each new dependency requires a justification
 comment in `go.mod`.
 
+### Adding a dependency
+
+Before adding any new module, verify it carries a license compatible with our MIT distribution.
+Permissive licenses are fine (MIT, BSD-2/3-Clause, Apache-2.0, ISC); these only require that we
+reproduce their notice in distributed binaries, which we do automatically (see below). **Reject
+copyleft licenses** (GPL, LGPL, AGPL, MPL, etc.) — they impose source-disclosure or relicensing
+obligations incompatible with this project. If in doubt about a license, flag it rather than pulling
+it in. Also check the module's *transitive* deps (`go list -deps ./cmd/dotsmith`), since they ship in
+the binary too.
+
+License notices for everything linked into the binary are collected into `THIRD_PARTY_LICENSES` by
+`scripts/licenses.sh` (via `go-licenses`). **This file is committed** — after adding, removing, or
+bumping a dependency, run `./scripts/licenses.sh` and commit the result. CI enforces this: the
+`licenses` job in `.github/workflows/ci.yml` regenerates the file and fails the build if it drifts
+from what's committed, and separately runs `go-licenses check` to reject any forbidden/restricted
+(copyleft) license. GoReleaser also regenerates it in its `before` hook so release archives are always
+current.
+
 ## Code Style
 
 Follow standard idiomatic Go conventions plus:

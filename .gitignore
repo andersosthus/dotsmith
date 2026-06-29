@@ -4,7 +4,6 @@ dist/
 *.exe
 coverage.out
 coverage.html
-THIRD_PARTY_LICENSES
 
 # Local-only security findings (keep private until fixed; see security-issues/README.md)
 security-issues/
