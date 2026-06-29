@@ -1961,3 +1961,154 @@ func TestBlockerError_Unwrap(t *testing.T) {
 		t.Error("errors.Is should find the wrapped error")
 	}
 }
+
+// TestLink_DryRun_CollectsLstatIOError verifies an unexpected lstat error in
+// dry-run is collected as an io-error blocker rather than aborting the run, and
+// that the underlying OS error remains reachable through errors.Is.
+func TestLink_DryRun_CollectsLstatIOError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	h := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	injectLstat(t, func(string) (os.FileInfo, error) {
+		return nil, fmt.Errorf("lstat boom: %w", os.ErrPermission)
+	})
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true},
+		[]FileRef{{RelPath: ".bashrc", ContentHash: h}})
+	if err != nil {
+		t.Fatalf("dry-run Link returned error: %v", err)
+	}
+	if len(result.Blockers) != 1 {
+		t.Fatalf("got %d blockers, want 1: %+v", len(result.Blockers), result.Blockers)
+	}
+	b := result.Blockers[0]
+	if b.Kind != BlockerIOError {
+		t.Errorf("Kind = %q, want %q", b.Kind, BlockerIOError)
+	}
+	if b.Detail == "" {
+		t.Error("Detail is empty")
+	}
+	if result.Created != 0 || result.Updated != 0 || result.Unchanged != 0 {
+		t.Errorf("blocked file leaked into counts: created=%d updated=%d unchanged=%d",
+			result.Created, result.Updated, result.Unchanged)
+	}
+}
+
+// TestLink_DryRun_CollectsReadlinkIOError verifies an unexpected readlink error
+// in dry-run is collected as an io-error blocker.
+func TestLink_DryRun_CollectsReadlinkIOError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	h := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	makeSymlink(t, compileDir, targetDir, ".bashrc")
+	injectReadlink(t, func(string) (string, error) {
+		return "", fmt.Errorf("readlink boom: %w", os.ErrPermission)
+	})
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true},
+		[]FileRef{{RelPath: ".bashrc", ContentHash: h}})
+	if err != nil {
+		t.Fatalf("dry-run Link returned error: %v", err)
+	}
+	if len(result.Blockers) != 1 || result.Blockers[0].Kind != BlockerIOError {
+		t.Fatalf("blockers = %+v, want one io-error", result.Blockers)
+	}
+}
+
+// TestLink_DryRun_CollectsSymlinkedParentIOError verifies an unexpected lstat
+// error on a parent component in dry-run is collected as an io-error blocker.
+func TestLink_DryRun_CollectsSymlinkedParentIOError(t *testing.T) {
+	compile, target := t.TempDir(), t.TempDir()
+	h := writeCompiled(t, compile, ".config/app.conf", "data\n")
+	parent := filepath.Join(target, ".config")
+	injectLstat(t, func(p string) (os.FileInfo, error) {
+		if p == parent {
+			return nil, fmt.Errorf("parent boom: %w", os.ErrPermission)
+		}
+		return os.Lstat(p)
+	})
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compile, TargetDir: target, DryRun: true},
+		[]FileRef{{RelPath: ".config/app.conf", ContentHash: h}})
+	if err != nil {
+		t.Fatalf("dry-run Link returned error: %v", err)
+	}
+	if len(result.Blockers) != 1 || result.Blockers[0].Kind != BlockerIOError {
+		t.Fatalf("blockers = %+v, want one io-error", result.Blockers)
+	}
+}
+
+// TestLink_DryRun_IOErrorSortedWithConflicts verifies io-error blockers appear in
+// the same sorted-by-RelPath list as conflict blockers, and that errors.Is still
+// reaches the underlying OS error through the *blockerError captured during the
+// dry-run.
+func TestLink_DryRun_IOErrorSortedWithConflicts(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	// "a" is a plain conflict (occupied target); "z" triggers an io-error on its
+	// own lstat only, so the conflict path for "a" is unaffected.
+	hConflict := writeCompiled(t, compileDir, "a", "data\n")
+	hIO := writeCompiled(t, compileDir, "z", "data\n")
+	if err := os.WriteFile(filepath.Join(targetDir, "a"), []byte("mine"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	ztarget := filepath.Join(targetDir, "z")
+	injectLstat(t, func(p string) (os.FileInfo, error) {
+		if p == ztarget {
+			return nil, fmt.Errorf("z boom: %w", os.ErrPermission)
+		}
+		return os.Lstat(p)
+	})
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true},
+		[]FileRef{{RelPath: "z", ContentHash: hIO}, {RelPath: "a", ContentHash: hConflict}})
+	if err != nil {
+		t.Fatalf("dry-run Link returned error: %v", err)
+	}
+	if len(result.Blockers) != 2 {
+		t.Fatalf("got %d blockers, want 2: %+v", len(result.Blockers), result.Blockers)
+	}
+	if result.Blockers[0].RelPath != "a" || result.Blockers[1].RelPath != "z" {
+		t.Errorf("blocker order = [%s %s], want [a z]",
+			result.Blockers[0].RelPath, result.Blockers[1].RelPath)
+	}
+	if result.Blockers[0].Kind != BlockerConflict {
+		t.Errorf("a: Kind = %q, want %q", result.Blockers[0].Kind, BlockerConflict)
+	}
+	if result.Blockers[1].Kind != BlockerIOError {
+		t.Errorf("z: Kind = %q, want %q", result.Blockers[1].Kind, BlockerIOError)
+	}
+}
+
+// TestLink_RealRun_FailsFast_IOError verifies a real (non-dry-run) run still
+// returns on the first io-error with today's exact message and an empty Blockers
+// slice, and that the underlying OS error remains reachable via errors.Is.
+func TestLink_RealRun_FailsFast_IOError(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	h := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	target := filepath.Join(targetDir, ".bashrc")
+	injectLstat(t, func(p string) (os.FileInfo, error) {
+		if p == target {
+			return nil, fmt.Errorf("forced lstat error: %w", os.ErrPermission)
+		}
+		return os.Lstat(p)
+	})
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{{RelPath: ".bashrc", ContentHash: h}})
+	if err == nil {
+		t.Fatal("expected real-run io-error, got nil")
+	}
+	want := fmt.Sprintf("link .bashrc: stat %s: forced lstat error: %v", target, os.ErrPermission)
+	if err.Error() != want {
+		t.Errorf("error message:\n got: %q\nwant: %q", err.Error(), want)
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Error("errors.Is should reach the underlying OS error through *blockerError")
+	}
+	if result != nil {
+		t.Errorf("real-run result should be nil on error, got %+v", result)
+	}
+}

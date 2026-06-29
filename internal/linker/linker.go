@@ -63,25 +63,30 @@ const (
 	// managed symlink: a real file, a symlink pointing elsewhere, or a symlinked
 	// parent directory. This mirrors the StatusConflict classification.
 	BlockerConflict BlockerKind = "conflict"
+	// BlockerIOError means an unexpected filesystem error (other than not-exist)
+	// occurred while inspecting a target — e.g. permission denied on lstat or
+	// readlink. In dry-run it is collected as a blocker rather than aborting the
+	// run; a real run still fails fast on the first one.
+	BlockerIOError BlockerKind = "io-error"
 )
 
 // Blocker is a single reason one file could not be linked during a dry-run.
 type Blocker struct {
 	// RelPath is the relative path of the file that could not be linked.
 	RelPath string
-	// Kind classifies the blocker (currently only conflict).
+	// Kind classifies the blocker (conflict or io-error).
 	Kind BlockerKind
 	// Detail is the human-readable leaf message describing the problem. It is
 	// byte-identical to the message a real run would surface for the same file.
 	Detail string
 }
 
-// blockerError is the typed error returned by the conflict leaf paths. It is the
-// single classification site: its Error() reproduces today's exact leaf message
-// so a real run is byte-identical, while Unwrap() preserves any wrapped OS error
-// so errors.Is checks still hold. In dry-run, linkFile extracts it via errors.As
-// to build a Blocker and continue; otherwise the error propagates and the real
-// run aborts as before.
+// blockerError is the typed error returned by the conflict and io-error leaf
+// paths. It is the single classification site: its Error() reproduces today's
+// exact leaf message so a real run is byte-identical, while Unwrap() preserves
+// any wrapped OS error so errors.Is checks still hold. In dry-run, linkFile
+// extracts it via errors.As to build a Blocker and continue; otherwise the error
+// propagates and the real run aborts as before.
 type blockerError struct {
 	kind BlockerKind
 	msg  string
@@ -342,7 +347,11 @@ func linkFile(cfg LinkConfig, f FileRef, s *state.State, r *LinkResult) error {
 func linkOne(cfg LinkConfig, f FileRef, sourcePath, targetPath string, s *state.State) (linkChange, error) {
 	fi, statErr := osLstatFunc(targetPath)
 	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return linkUnchanged, fmt.Errorf("stat %s: %w", targetPath, statErr)
+		return linkUnchanged, &blockerError{
+			kind: BlockerIOError,
+			msg:  fmt.Sprintf("stat %s: %v", targetPath, statErr),
+			err:  statErr,
+		}
 	}
 	if errors.Is(statErr, os.ErrNotExist) {
 		return linkNew(cfg, f, sourcePath, targetPath, s)
@@ -391,7 +400,11 @@ func guardSymlinkedParents(targetDir, targetPath string) error {
 				dir = filepath.Dir(dir)
 				continue
 			}
-			return fmt.Errorf("stat parent %s: %w", dir, err)
+			return &blockerError{
+				kind: BlockerIOError,
+				msg:  fmt.Sprintf("stat parent %s: %v", dir, err),
+				err:  err,
+			}
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return &blockerError{
@@ -424,7 +437,11 @@ func linkExisting(
 	}
 	existing, err := osReadlinkFunc(targetPath)
 	if err != nil {
-		return linkUnchanged, fmt.Errorf("readlink %s: %w", targetPath, err)
+		return linkUnchanged, &blockerError{
+			kind: BlockerIOError,
+			msg:  fmt.Sprintf("readlink %s: %v", targetPath, err),
+			err:  err,
+		}
 	}
 	if existing != sourcePath {
 		return linkUnchanged, &blockerError{
