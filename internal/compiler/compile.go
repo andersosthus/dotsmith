@@ -43,6 +43,12 @@ type CompiledFile struct {
 	ContentHash string
 	// FromEncrypted is true if any source subfile was age-encrypted.
 	FromEncrypted bool
+	// SourceSignature is the ordered digest of the contributing subfiles'
+	// content hashes (ciphertext for .age sources), computed without decrypting.
+	// It is the gate-1 input for reuse (see ADR 0015) and is recorded in the
+	// manifest on every compile. This slice only records it; it does not yet
+	// change compile behavior.
+	SourceSignature string
 }
 
 // DryRunReport records, for one age-encrypted source file, which identity would
@@ -111,13 +117,35 @@ func Compile(ctx context.Context, cfg CompileConfig) (*CompileResult, error) {
 }
 
 // compileEntry assembles the content of a single FileEntry, returning any dry-run
-// probe reports for age-encrypted sources it touched.
+// probe reports for age-encrypted sources it touched. It also records the
+// target's source signature (gate-1 input for reuse, see ADR 0015) — computed
+// from the raw source bytes without decrypting — on the returned CompiledFile.
 func compileEntry(ctx context.Context, entry *FileEntry, cfg CompileConfig) (*CompiledFile, []DryRunReport, error) {
+	var (
+		cf      *CompiledFile
+		reports []DryRunReport
+		err     error
+	)
 	if entry.IsRegular {
-		return compileRegular(ctx, entry, cfg)
+		cf, reports, err = compileRegular(ctx, entry, cfg)
+	} else {
+		cf, reports, err = compileSubfiles(ctx, entry, cfg)
 	}
-	return compileSubfiles(ctx, entry, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sig, err := sourceSignatureFunc(ctx, entry.Subfiles)
+	if err != nil {
+		return nil, nil, err
+	}
+	cf.SourceSignature = sig
+	return cf, reports, nil
 }
+
+// sourceSignatureFunc is the source-signature sink, injectable so tests can
+// exercise the signature-failure path that a just-read source otherwise hides.
+var sourceSignatureFunc = SourceSignature
 
 // compileRegular copies a regular (non-subfile) file as-is.
 func compileRegular(ctx context.Context, entry *FileEntry, cfg CompileConfig) (*CompiledFile, []DryRunReport, error) {
@@ -318,7 +346,10 @@ func ensureCompileDir(compileDir string) error {
 func currentManifest(result *CompileResult) map[string]state.CompiledEntry {
 	m := make(map[string]state.CompiledEntry, len(result.Files))
 	for _, cf := range result.Files {
-		m[cf.RelPath] = state.CompiledEntry{ContentHash: cf.ContentHash}
+		m[cf.RelPath] = state.CompiledEntry{
+			ContentHash:     cf.ContentHash,
+			SourceSignature: cf.SourceSignature,
+		}
 	}
 	return m
 }
