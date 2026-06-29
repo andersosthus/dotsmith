@@ -43,6 +43,18 @@ the SSH keys already present on the machine — rather than requiring each one t
 be named in config.
 _Avoid_: key scanning, auto-load.
 
+**Binary age file**:
+An `.age` file in age's default encoding — the raw binary format whose intro line
+is the literal `age-encryption.org/v1`. This is what plain `age -r …` produces.
+_Avoid_: raw age file, unarmored file.
+
+**Armored age file**:
+An `.age` file in age's ASCII-armor encoding — a PEM-style envelope opening with
+`-----BEGIN AGE ENCRYPTED FILE-----`, produced only when `age` is run with
+`-a`/`--armor`. Dotsmith accepts both encodings transparently, detecting which by
+inspecting the leading bytes; `.age` on disk implies neither encoding.
+_Avoid_: PEM age file, text age file.
+
 ### Compilation and linking
 
 **Source signature**:
