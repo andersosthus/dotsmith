@@ -128,6 +128,20 @@ Zero warnings policy: fix every lint warning before committing.
 - Goreleaser produces binaries, tarballs, checksums, and shell completion scripts
 - Shell completions are also generated at runtime via `dotsmith shell <bash|zsh|fish>`
 
+### Cutting a release
+
+A release is triggered by pushing a `v*` tag, which runs `.github/workflows/release.yml`
+(GoReleaser). To create one:
+
+1. Make sure `main` is up to date and the tree is clean.
+2. Pick the next version with semver against the last tag (`git describe --tags --abbrev=0`):
+   new user-facing feature → minor bump; fixes/maintenance only → patch bump.
+3. Create an **annotated** tag whose message is changelog-style — a `vX.Y.Z` header line
+   followed by grouped bullets referencing the merged PR/issue numbers (match the style of
+   existing tag messages, e.g. `git show v0.2.1`).
+4. Push the tag: `git push origin vX.Y.Z`. This kicks off the Release workflow; confirm with
+   `gh run list --workflow=release.yml`.
+
 ## Workflow
 
 ```bash
