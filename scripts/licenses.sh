@@ -10,7 +10,7 @@ LICENSES_BIN="${GOPATH}/bin/go-licenses"
 
 if [[ ! -x "${LICENSES_BIN}" ]]; then
     echo "Installing go-licenses..."
-    go install github.com/google/go-licenses@latest
+    go install github.com/google/go-licenses/v2@v2.0.1
 fi
 
 SAVE_DIR="$(mktemp -d)"

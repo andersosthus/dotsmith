@@ -72,7 +72,7 @@ jobs:
       # can ship in the binary.
       - name: Check dependency licenses
         run: |
-          go install github.com/google/go-licenses@latest
+          go install github.com/google/go-licenses/v2@v2.0.1
           "$(go env GOPATH)/bin/go-licenses" check ./cmd/dotsmith \
             --disallowed_types=forbidden,restricted
 
