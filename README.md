@@ -367,6 +367,11 @@ files carry an `.age` extension and participate in the override system the same 
 files. Dotsmith does not encrypt files for you — encrypt them yourself with `age` (or `rage`) before
 adding them to the repo, using a recipient that matches one of your identities.
 
+Both age encodings are accepted transparently: the **binary** default (plain `age -r …`) and the
+**ASCII-armored** form (`age -a -r …`). Dotsmith detects which by inspecting the file's leading
+bytes, so you never declare or configure the encoding — a `.age` file produced either way compiles
+the same. A file that is neither a valid binary nor armored age file surfaces age's own header error.
+
 ### Candidate identity set
 
 Dotsmith does not decrypt with a single key. Each run it assembles a **candidate identity set** and

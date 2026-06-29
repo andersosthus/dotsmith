@@ -164,6 +164,26 @@ func encryptToRecipients(t *testing.T, plaintext string, recipients ...age.Recip
 	return buf.Bytes()
 }
 
+// encryptBinaryToRecipients mirrors encryptToRecipients but omits the armor
+// writer, producing age's default binary encoding (intro line
+// "age-encryption.org/v1"). It is the binary counterpart of the existing armor
+// fixture helper, making file encoding a first-class test axis.
+func encryptBinaryToRecipients(t *testing.T, plaintext string, recipients ...age.Recipient) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, recipients...)
+	if err != nil {
+		t.Fatalf("age.Encrypt: %v", err)
+	}
+	if _, err = io.WriteString(w, plaintext); err != nil {
+		t.Fatalf("write plaintext: %v", err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatalf("close age writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // sshRecipient builds an age recipient from an SSH public key.
 func sshRecipient(t *testing.T, pub ssh.PublicKey) age.Recipient {
 	t.Helper()
@@ -1058,7 +1078,77 @@ func TestDecrypt_ReadAllError(t *testing.T) {
 
 // ---- DecryptFile ------------------------------------------------------------
 
+// TestIsArmored exercises the pure encoding predicate in isolation: the armor
+// marker boundary, short/empty inputs, and a binary intro line — no ciphertext
+// construction needed.
+func TestIsArmored(t *testing.T) {
+	tests := []struct {
+		name    string
+		leading []byte
+		want    bool
+	}{
+		{name: "exact marker", leading: []byte(armor.Header), want: true},
+		{name: "marker prefix of longer input", leading: []byte(armor.Header + "\nrest of armor envelope"), want: true},
+		{name: "marker missing trailing dash", leading: []byte(armor.Header[:len(armor.Header)-1]), want: false},
+		{name: "binary intro line", leading: []byte("age-encryption.org/v1\n"), want: false},
+		{name: "empty input", leading: []byte{}, want: false},
+		{name: "nil input", leading: nil, want: false},
+		{name: "short read shorter than marker", leading: []byte("-----BEGIN"), want: false},
+		{name: "leading whitespace before marker not tolerated", leading: []byte("\n" + armor.Header), want: false},
+		{name: "garbage", leading: []byte("not an age file at all"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isArmored(tt.leading); got != tt.want {
+				t.Errorf("isArmored(%q) = %v, want %v", tt.leading, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDecryptFile_RoundTrip proves DecryptFile decrypts to the correct plaintext
+// for both age encodings: armored (age -a) and binary (the age CLI default).
+// Parametrizing across encodings makes the binary path — the one that was
+// previously broken — a first-class case rather than an untested dimension.
 func TestDecryptFile_RoundTrip(t *testing.T) {
+	encodings := []struct {
+		name    string
+		encrypt func(*testing.T, string, ...age.Recipient) []byte
+	}{
+		{name: "armor", encrypt: encryptToRecipients},
+		{name: "binary", encrypt: encryptBinaryToRecipients},
+	}
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			id := generateAgeIdentity(t)
+			keyPath := writeAgeKeyFile(t, dir, id)
+			set, err := Resolve(context.Background(), KeySource{IdentityFile: keyPath, IdentityFileExplicit: true}, nil)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			encPath := filepath.Join(dir, "secret.txt.age")
+			if werr := os.WriteFile(encPath, enc.encrypt(t, "file contents", id.Recipient()), 0o600); werr != nil {
+				t.Fatalf("WriteFile: %v", werr)
+			}
+
+			out, err := DecryptFile(context.Background(), encPath, set)
+			if err != nil {
+				t.Fatalf("DecryptFile: %v", err)
+			}
+			if string(out) != "file contents" {
+				t.Errorf("got %q", out)
+			}
+		})
+	}
+}
+
+// TestDecryptFile_BinaryRegression reproduces the reported bug directly: a
+// binary-format .age file (as produced by the default `age` CLI) decrypts
+// cleanly through DecryptFile, where it previously failed with a misleading
+// "invalid armor" error.
+func TestDecryptFile_BinaryRegression(t *testing.T) {
 	dir := t.TempDir()
 	id := generateAgeIdentity(t)
 	keyPath := writeAgeKeyFile(t, dir, id)
@@ -1067,17 +1157,24 @@ func TestDecryptFile_RoundTrip(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 
-	encPath := filepath.Join(dir, "secret.txt.age")
-	if werr := os.WriteFile(encPath, encryptToRecipients(t, "file contents", id.Recipient()), 0o600); werr != nil {
+	ciphertext := encryptBinaryToRecipients(t, "authorized_keys body", id.Recipient())
+	// Guard the fixture: it must be true binary, starting with age's intro line
+	// rather than the armor marker, or the regression would not be exercised.
+	if isArmored(ciphertext) {
+		t.Fatal("fixture is armored; expected binary encoding")
+	}
+
+	encPath := filepath.Join(dir, "authorized_keys.age")
+	if werr := os.WriteFile(encPath, ciphertext, 0o600); werr != nil {
 		t.Fatalf("WriteFile: %v", werr)
 	}
 
 	out, err := DecryptFile(context.Background(), encPath, set)
 	if err != nil {
-		t.Fatalf("DecryptFile: %v", err)
+		t.Fatalf("DecryptFile on binary .age file: %v", err)
 	}
-	if string(out) != "file contents" {
-		t.Errorf("got %q", out)
+	if string(out) != "authorized_keys body" {
+		t.Errorf("got %q, want %q", out, "authorized_keys body")
 	}
 }
 
@@ -1154,8 +1251,15 @@ func TestDecryptFile_CorruptCiphertext(t *testing.T) {
 	if werr := os.WriteFile(encPath, []byte("not valid age ciphertext"), 0o600); werr != nil {
 		t.Fatalf("WriteFile: %v", werr)
 	}
-	if _, derr := DecryptFile(context.Background(), encPath, set); derr == nil {
+	_, derr := DecryptFile(context.Background(), encPath, set)
+	if derr == nil {
 		t.Fatal("expected error for corrupt ciphertext via DecryptFile, got nil")
+	}
+	// A file matching neither marker takes the binary path, so age surfaces its
+	// own accurate binary-header error rather than the misleading "invalid armor"
+	// message that defaulting to the armor reader would produce.
+	if strings.Contains(derr.Error(), "invalid armor") {
+		t.Errorf("error misleadingly blames armor for a non-armored file: %v", derr)
 	}
 }
 
