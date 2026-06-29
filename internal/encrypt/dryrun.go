@@ -10,7 +10,6 @@ import (
 	"os"
 
 	"filippo.io/age"
-	"filippo.io/age/armor"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -137,8 +136,7 @@ func (s IdentitySet) DryRunProbeFile(_ context.Context, path string) (DryRunResu
 // surfaced.
 func captureStanzas(r io.Reader) ([]*age.Stanza, error) {
 	sentinel := &captureIdentity{}
-	armorReader := armor.NewReader(r)
-	_, err := age.Decrypt(armorReader, sentinel)
+	_, err := age.Decrypt(decryptReader(r), sentinel)
 	var noMatch *age.NoIdentityMatchError
 	if !errors.As(err, &noMatch) {
 		return nil, fmt.Errorf("read age header: %w — file may be corrupt or not an age file", err)

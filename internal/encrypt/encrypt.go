@@ -3,6 +3,7 @@
 package encrypt
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -13,6 +14,45 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/armor"
 )
+
+// isArmored reports whether age ciphertext is in the ASCII-armored encoding,
+// decided purely from its leading bytes. It is a strict byte-prefix match
+// against the armor envelope marker (armor.Header): the leading bytes must
+// equal the marker exactly, with no leading-whitespace tolerance (age's default
+// armored output starts the marker at byte 0).
+//
+// Detection is positive-detect-armor, default-to-binary: only an exact marker
+// match is treated as armored, and everything else — true binary files and
+// corrupt/non-age files alike — is treated as binary. This is deliberate. If a
+// broken file were instead defaulted to the armor path, age would reject it
+// with a misleading "invalid armor" error; defaulting to binary lets age
+// surface its own accurate binary-header error for such files. A slice shorter
+// than the marker (a short read or Peek-EOF on a tiny file) cannot match the
+// prefix and is therefore classified as binary, so age reports any truncation.
+func isArmored(leading []byte) bool {
+	return strings.HasPrefix(string(leading), armor.Header)
+}
+
+// decryptReader peeks the leading bytes of src and returns an io.Reader ready to
+// hand straight to age.Decrypt: an armor reader when the input is armored, and
+// the buffered reader itself (unwrapped) for binary input. It is the shared
+// encoding-detection seam, intended as the single place the armored/binary
+// decision is made so call sites cannot drift. All three decrypt paths — the
+// streaming Decrypt, DecryptFile, and the dry-run stanza-capture probe — route
+// through it.
+//
+// Peeking — rather than trying one decoder and rewinding on failure — keeps the
+// streaming io.Reader contract intact and is deterministic. A short Peek (fewer
+// bytes than the marker, e.g. on EOF) is not an error here: isArmored treats the
+// short slice as binary and age then reports any truncation itself.
+func decryptReader(src io.Reader) io.Reader {
+	br := bufio.NewReader(src)
+	leading, _ := br.Peek(len(armor.Header))
+	if isArmored(leading) {
+		return armor.NewReader(br)
+	}
+	return br
+}
 
 // KeySource describes the inputs from which a candidate identity set is
 // resolved. The native age identity file is kept for back-compat; SSH discovery
@@ -47,8 +87,7 @@ func Decrypt(_ context.Context, src io.Reader, set IdentitySet) ([]byte, error) 
 
 	set.setDecryptSource("") // unnamed stream: a passphrase prompt names only the key
 
-	armorReader := armor.NewReader(src)
-	r, err := age.Decrypt(armorReader, set.identities...)
+	r, err := age.Decrypt(decryptReader(src), set.identities...)
 	if err != nil {
 		return nil, set.wrapDecryptError("", err)
 	}
@@ -75,8 +114,7 @@ func DecryptFile(ctx context.Context, path string, set IdentitySet) ([]byte, err
 
 	set.setDecryptSource(path) // name this file in any SSH-key passphrase prompt
 
-	armorReader := armor.NewReader(f)
-	r, err := age.Decrypt(armorReader, set.identities...)
+	r, err := age.Decrypt(decryptReader(f), set.identities...)
 	if err != nil {
 		return nil, set.wrapDecryptError(path, err)
 	}
