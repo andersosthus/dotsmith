@@ -111,3 +111,15 @@ Ceasing to manage a path — dropping its state entry and removing dotsmith's ow
 artifact — without touching what the user has put in its place. Done when a
 managed symlink has been replaced by a real file the user created.
 _Avoid_: orphan, abandon, release.
+
+**Blocker**:
+A reason a single file could not be linked during a `link` operation — naming
+the file, a *kind*, and a human-readable detail. Kinds: a **conflict** (the
+target is occupied by something that is not our managed symlink — the same
+situation `status` reports as `StatusConflict`, covering an occupied path, a
+symlink pointing elsewhere, or a symlinked parent directory) or an **io-error**
+(an unexpected filesystem error other than not-exist while inspecting the
+target). A real `link` run still fails fast on the first blocker; a dry-run
+collects *all* blockers across every file and reports them together.
+_Avoid_: bare "conflict" for the whole set (conflict is one kind of blocker),
+error (too vague).

@@ -60,6 +60,19 @@ func runWithDotfiles(t *testing.T, dotfilesDir string, args ...string) (string, 
 	return run(t, append([]string{"--dotfiles-dir", dotfilesDir}, args...)...)
 }
 
+// runSplit executes a command with separate stdout and stderr buffers so a test
+// can assert which stream a line landed on.
+func runSplit(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	cmd := NewRootCmd()
+	var outBuf, errBuf bytes.Buffer
+	cmd.SetOut(&outBuf)
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs(args)
+	err = cmd.ExecuteContext(context.Background())
+	return outBuf.String(), errBuf.String(), err
+}
+
 // makeDotfiles creates a minimal dotfiles structure in a temp dir.
 func makeDotfiles(t *testing.T) string {
 	t.Helper()
@@ -411,6 +424,113 @@ func TestLinkCmd_WarnsDisowned(t *testing.T) {
 	}
 }
 
+// TestLinkCmd_DryRun_CollectsBlockers verifies a real dry-run link against a
+// tree with multiple conflicting files lists all of them in one run (no early
+// abort), prints the summary to stdout and the sorted blocker list to stderr,
+// and exits non-zero.
+func TestLinkCmd_DryRun_CollectsBlockers(t *testing.T) {
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "export A=1\n")
+	writeSubfile(t, root, ".subfile-010.vimrc", "set nocompatible\n")
+	compileDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	// Real compile so the compile dir holds .bashrc and .vimrc.
+	if _, err := run(t, "--dotfiles-dir", root, "compile", "--compile-dir", compileDir); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// Occupy both targets with conflicting real files (alphabetical order
+	// .bashrc, .vimrc lets us assert the sort independently of walk order).
+	for _, name := range []string{".vimrc", ".bashrc"} {
+		if err := os.WriteFile(filepath.Join(targetDir, name), []byte("mine"), 0o644); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+	}
+
+	stdout, stderr, err := runSplit(t, "--dotfiles-dir", root, "--dry-run", "link",
+		"--compile-dir", compileDir, "--target-dir", targetDir)
+	assertTwoBlockerDryRun(t, stdout, stderr, err)
+	// Both conflicts are reported, sorted: .bashrc before .vimrc.
+	bashIdx := strings.Index(stderr, ".bashrc")
+	vimIdx := strings.Index(stderr, ".vimrc")
+	if bashIdx < 0 || vimIdx < 0 {
+		t.Fatalf("stderr should mention both .bashrc and .vimrc: %q", stderr)
+	}
+	if bashIdx > vimIdx {
+		t.Errorf("blockers not sorted: .bashrc should precede .vimrc in %q", stderr)
+	}
+}
+
+// assertTwoBlockerDryRun checks the shared expectations of a dry-run that found
+// two blockers: a non-zero exit (sentinel error), the summary on stdout, and the
+// blocker header on stderr.
+func assertTwoBlockerDryRun(t *testing.T, stdout, stderr string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected non-zero exit (sentinel error) with blockers, got nil")
+	}
+	if !strings.Contains(err.Error(), "2 blocker(s) would prevent linking") {
+		t.Errorf("sentinel error = %q, want it to mention 2 blockers", err.Error())
+	}
+	if !strings.Contains(stdout, "linked:") {
+		t.Errorf("stdout = %q, want the linked summary line", stdout)
+	}
+	if !strings.Contains(stderr, "2 blocker(s) would prevent linking:") {
+		t.Errorf("stderr = %q, want the blocker header", stderr)
+	}
+}
+
+// TestLinkCmd_DryRun_NoBlockers verifies a clean dry-run exits zero and prints
+// no blocker section.
+func TestLinkCmd_DryRun_NoBlockers(t *testing.T) {
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "export A=1\n")
+	compileDir := t.TempDir()
+	if _, err := run(t, "--dotfiles-dir", root, "compile", "--compile-dir", compileDir); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	stdout, stderr, err := runSplit(t, "--dotfiles-dir", root, "--dry-run", "link",
+		"--compile-dir", compileDir, "--target-dir", t.TempDir())
+	if err != nil {
+		t.Fatalf("clean dry-run should exit zero, got: %v", err)
+	}
+	if !strings.Contains(stdout, "linked:") {
+		t.Errorf("stdout = %q, want the linked summary line", stdout)
+	}
+	if strings.Contains(stderr, "blocker") {
+		t.Errorf("stderr = %q, want no blocker section for a clean dry-run", stderr)
+	}
+}
+
+// TestLinkCmd_RealRun_ConflictUnchanged verifies a real (non-dry-run) link still
+// fails on the first conflict with today's error message and emits no blocker
+// overview.
+func TestLinkCmd_RealRun_ConflictUnchanged(t *testing.T) {
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "export A=1\n")
+	compileDir := t.TempDir()
+	targetDir := t.TempDir()
+	if _, err := run(t, "--dotfiles-dir", root, "compile", "--compile-dir", compileDir); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, ".bashrc"), []byte("mine"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, stderr, err := runSplit(t, "--dotfiles-dir", root, "link",
+		"--compile-dir", compileDir, "--target-dir", targetDir)
+	if err == nil {
+		t.Fatal("expected real-run conflict error, got nil")
+	}
+	if !strings.Contains(err.Error(), "exists and is not a symlink") {
+		t.Errorf("error = %q, want today's conflict message", err.Error())
+	}
+	if strings.Contains(stderr, "blocker(s) would prevent linking") {
+		t.Errorf("stderr = %q, real run must not print the blocker overview", stderr)
+	}
+}
+
 // ---- apply ------------------------------------------------------------------
 
 func TestApplyCmd_Success(t *testing.T) {
@@ -486,6 +606,38 @@ func TestApplyCmd_WarnsDisowned(t *testing.T) {
 	if !strings.Contains(out, "no longer dotsmith-managed") || !strings.Contains(out, ".gitconfig") {
 		t.Errorf("apply output = %q, want disown warning mentioning .gitconfig", out)
 	}
+}
+
+// TestApplyCmd_DryRun_CollectsBlockers verifies apply --dry-run behaves like
+// link --dry-run: it compiles and previews the link, collects every conflict,
+// prints the summary to stdout and the sorted blocker list to stderr, and exits
+// non-zero.
+func TestApplyCmd_DryRun_CollectsBlockers(t *testing.T) {
+	root := makeDotfiles(t)
+	writeSubfile(t, root, ".subfile-010.bashrc", "export A=1\n")
+	writeSubfile(t, root, ".subfile-010.vimrc", "set nocompatible\n")
+	compileDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	// A real apply first so the compile dir and conflicting targets exist, then
+	// replace the managed symlinks with conflicting real files.
+	if _, err := run(t, "--dotfiles-dir", root, "apply",
+		"--compile-dir", compileDir, "--target-dir", targetDir); err != nil {
+		t.Fatalf("apply (real): %v", err)
+	}
+	for _, name := range []string{".bashrc", ".vimrc"} {
+		p := filepath.Join(targetDir, name)
+		if err := os.Remove(p); err != nil {
+			t.Fatalf("Remove %s: %v", name, err)
+		}
+		if err := os.WriteFile(p, []byte("mine"), 0o644); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+	}
+
+	stdout, stderr, err := runSplit(t, "--dotfiles-dir", root, "--dry-run", "apply",
+		"--compile-dir", compileDir, "--target-dir", targetDir)
+	assertTwoBlockerDryRun(t, stdout, stderr, err)
 }
 
 // ---- render -----------------------------------------------------------------

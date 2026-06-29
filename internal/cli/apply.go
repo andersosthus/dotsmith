@@ -75,7 +75,7 @@ func newApplyCmd() *cobra.Command {
 				stats.Written, stats.Reused, stats.Unchanged, len(stats.Pruned),
 				linkResult.Created, linkResult.Updated, linkResult.Unchanged, linkResult.Removed)
 			warnDisowned(cmd.ErrOrStderr(), linkResult.Disowned)
-			return nil
+			return reportBlockers(cmd.ErrOrStderr(), "apply", linkResult.Blockers)
 		},
 	}
 }

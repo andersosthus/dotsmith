@@ -202,8 +202,28 @@ cloud-synced location — dotsmith refuses to plant a managed link inside it:
 `link` reports a conflict and tells you to replace the symlink with a real
 directory or move the target out from under it. And when cleaning up empty
 directories after a removal, the climb stops at the first symlinked ancestor, so
-`clean` and orphan removal never unlink your symlinked parent dir. (The conflict
-fires in `--dry-run` too, so a dry run reports it without writing anything.)
+`clean` and orphan removal never unlink your symlinked parent dir.
+
+### Conflicts and dry-run blockers
+
+A *blocker* is anything that stops dotsmith from linking a target. There are two
+kinds. A **conflict** is a target occupied by something that is not our managed
+symlink: a real file or non-symlink, a symlink pointing somewhere else, or a
+symlinked parent directory (above). An **io-error** is an unexpected filesystem
+error — anything other than not-exist — while inspecting a target, such as
+permission denied on the `lstat` or `readlink` of the target or one of its
+parents. A real `link`/`apply` run **fails fast** on the first blocker it hits —
+it stops before touching the filesystem further and reports that single blocker
+with a suggested fix where applicable.
+
+`--dry-run` instead previews the whole picture: it continues past every
+blocker, collecting each one (conflicts and io-errors alike) and reporting them
+all together in one run rather than one-at-a-time across repeated runs. The
+`linked: …` summary (reflecting the files that *would* link) goes to stdout; the
+sorted blocker list goes to stderr. A dry-run that finds any blockers exits
+non-zero so scripts and CI get a "this would fail" signal even though nothing
+was written; a dry-run with no blockers prints no blocker section and exits
+zero.
 
 ### Clean
 
