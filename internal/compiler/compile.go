@@ -37,8 +37,12 @@ type CompileConfig struct {
 	// requested and no key is unlocked; the probe outcomes are returned in
 	// CompileResult.DryRunReports. Encrypted file content is left empty.
 	//
-	// Dry-run does not reuse: it probes every encrypted source unconditionally
-	// (ADR 0004), so the reuse gate is not consulted under DryRun.
+	// Dry-run never reuses a target: it probes every encrypted source
+	// unconditionally (ADR 0004) so it remains the reuse-independent way to verify
+	// key health. It still evaluates the reuse gate per target, but only to
+	// annotate each CompiledFile.WouldReuse — telling the user which targets a
+	// real compile would reuse versus recompile (user story 12) — without skipping
+	// the probe or writing anything.
 	DryRun bool
 }
 
@@ -63,6 +67,14 @@ type CompiledFile struct {
 	// SourceSignature carry the values recorded by the previous compile so the
 	// linker keeps its symlink and the manifest is rewritten unchanged.
 	Reused bool
+	// WouldReuse annotates a dry-run compile: it is true when a real compile
+	// would reuse this target's existing output (both reuse gates passed) and
+	// false when it would recompile (see ADR 0015, user story 12). It is set only
+	// under DryRun and is purely informational — dry-run still probes every
+	// encrypted source unconditionally (ADR 0004) regardless of this value, so the
+	// key-health report is unaffected. It is always false on a normal compile,
+	// where the actual decision is carried by Reused.
+	WouldReuse bool
 }
 
 // DryRunReport records, for one age-encrypted source file, which identity would
@@ -169,8 +181,15 @@ func Compile(ctx context.Context, cfg CompileConfig) (*CompileResult, error) {
 // it then runs the two-gate reuse check against the prior state: if both gates
 // pass the target is reused — no source is decrypted or read for content — and a
 // flagged CompiledFile carrying the prior ContentHash and signature is returned
-// with nil Content. Otherwise (or under dry-run, which never reuses) it falls
-// back to decrypting and assembling as before.
+// with nil Content. Otherwise it falls back to decrypting and assembling as
+// before.
+//
+// Under dry-run the target is never actually reused: every encrypted source is
+// still probed unconditionally (the key-health probe, ADR 0004) so the identity
+// report is independent of reuse. The reuse gate is still evaluated, but only to
+// annotate the result's WouldReuse flag — telling the user which targets a real
+// compile would reuse versus recompile (user story 12) — without skipping the
+// probe or assembling. Both the gate and the probe read only; neither decrypts.
 func compileEntry(
 	ctx context.Context, entry *FileEntry, cfg CompileConfig, prior *state.State,
 ) (*CompiledFile, []DryRunReport, error) {
@@ -179,9 +198,9 @@ func compileEntry(
 		return nil, nil, err
 	}
 
-	if !cfg.DryRun && cfg.CompileDir != "" {
+	if cfg.CompileDir != "" {
 		decision := reuseGate(prior.Compiled, cfg.CompileDir, entry.Target, sig)
-		if decision.Reuse {
+		if decision.Reuse && !cfg.DryRun {
 			return &CompiledFile{
 				RelPath:         entry.Target,
 				Content:         nil,
@@ -191,22 +210,37 @@ func compileEntry(
 				Reused:          true,
 			}, nil, nil
 		}
+		if cfg.DryRun {
+			// Annotate but do not skip: the unconditional probe below must still
+			// run so dry-run reports key health even for would-be-reused targets.
+			cf, reports, probeErr := assembleEntry(ctx, entry, cfg)
+			if probeErr != nil {
+				return nil, nil, probeErr
+			}
+			cf.SourceSignature = sig
+			cf.WouldReuse = decision.Reuse
+			return cf, reports, nil
+		}
 	}
 
-	var (
-		cf      *CompiledFile
-		reports []DryRunReport
-	)
-	if entry.IsRegular {
-		cf, reports, err = compileRegular(ctx, entry, cfg)
-	} else {
-		cf, reports, err = compileSubfiles(ctx, entry, cfg)
-	}
+	cf, reports, err := assembleEntry(ctx, entry, cfg)
 	if err != nil {
 		return nil, nil, err
 	}
 	cf.SourceSignature = sig
 	return cf, reports, nil
+}
+
+// assembleEntry reads and assembles a target's content, dispatching on whether
+// it is a regular file or a subfile composition. Under dry-run it probes (not
+// decrypts) each encrypted source, returning the resulting DryRunReports.
+func assembleEntry(
+	ctx context.Context, entry *FileEntry, cfg CompileConfig,
+) (*CompiledFile, []DryRunReport, error) {
+	if entry.IsRegular {
+		return compileRegular(ctx, entry, cfg)
+	}
+	return compileSubfiles(ctx, entry, cfg)
 }
 
 // entryFromEncrypted reports whether any subfile of entry is age-encrypted,

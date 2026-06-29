@@ -40,6 +40,9 @@ func newCompileCmd() *cobra.Command {
 			}
 
 			printDryRunReports(cmd.OutOrStdout(), result.DryRunReports)
+			if cfg.DryRun {
+				printDryRunReuse(cmd.OutOrStdout(), result.Files)
+			}
 
 			writeCfg := compiler.WriteConfig{
 				CompileDir: cfg.CompileDir,
