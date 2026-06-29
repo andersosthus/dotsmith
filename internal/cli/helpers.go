@@ -62,6 +62,33 @@ func printDryRunReports(w io.Writer, reports []compiler.DryRunReport) {
 	}
 }
 
+// printDryRunReuse annotates, under dry-run, which compiled targets a real
+// compile would reuse versus recompile (user story 12). It prints one line per
+// target plus a summary count, so the user understands what a real run would do
+// without changing anything. It is a no-op when there are no files. This is
+// distinct from the key-health probe (printDryRunReports): the probe runs
+// unconditionally for every encrypted source regardless of reuse (ADR 0004),
+// whereas this annotation reports the reuse decision the probe does not affect.
+func printDryRunReuse(w io.Writer, files []compiler.CompiledFile) {
+	if len(files) == 0 {
+		return
+	}
+	reuse := 0
+	for _, f := range files {
+		// RelPath is a repo-controlled target path; render with %q so any
+		// terminal control sequences in it cannot manipulate or spoof the
+		// terminal (same reasoning as printDryRunReports).
+		if f.WouldReuse {
+			reuse++
+			_, _ = fmt.Fprintf(w, "would reuse %q\n", f.RelPath)
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "would recompile %q\n", f.RelPath)
+	}
+	_, _ = fmt.Fprintf(w, "dry-run: %d would reuse, %d would recompile\n",
+		reuse, len(files)-reuse)
+}
+
 // danglingWarnCap is the maximum number of dangling paths listed individually
 // in the warning; beyond it the remainder is summarised as a count.
 const danglingWarnCap = 10

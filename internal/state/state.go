@@ -38,10 +38,20 @@ type SymlinkEntry struct {
 // file's hash is therefore stored twice — here (what was compiled) and in its
 // SymlinkEntry (what was linked) — answering different questions; the two are
 // intentionally not deduped.
+//
+// ContentHash and SourceSignature answer the two reuse gates (see ADR 0015):
+// ContentHash asks "is the artifact still the one I wrote?" and SourceSignature
+// asks "have the inputs changed?". They are intentionally distinct.
 type CompiledEntry struct {
 	// ContentHash is the hex-encoded content hash of the compiled file at the
 	// time it was produced.
 	ContentHash string `json:"content_hash"`
+	// SourceSignature is the ordered digest of the content hash of each
+	// contributing subfile, computed without decrypting any encrypted source
+	// (see ADR 0015). It is omitted from the JSON when empty so that state files
+	// written by older binaries — which have no signature — round-trip cleanly;
+	// a loaded entry with an absent signature is treated as the empty string.
+	SourceSignature string `json:"source_signature,omitempty"`
 }
 
 // State represents the full contents of the state file.

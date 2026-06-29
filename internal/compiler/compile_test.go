@@ -14,6 +14,7 @@ import (
 
 	"github.com/andersosthus/dotsmith/internal/encrypt"
 	"github.com/andersosthus/dotsmith/internal/identity"
+	"github.com/andersosthus/dotsmith/internal/state"
 )
 
 // generateKey creates a new age identity, writes it to a temp file, and resolves
@@ -640,6 +641,93 @@ func assertMode(t *testing.T, path string, want os.FileMode) {
 	}
 	if info.Mode().Perm() != want {
 		t.Errorf("%s mode = %o, want %o", path, info.Mode().Perm(), want)
+	}
+}
+
+func TestCompile_PopulatesSourceSignature(t *testing.T) {
+	root := t.TempDir()
+	base := makeDir(t, root, "base")
+	writeFile(t, base, "aliases.subfile-010.sh", "alias ll='ls -la'\n")
+	writeFile(t, base, "aliases.subfile-020.sh", "alias gs='git status'\n")
+	writeFile(t, base, ".vimrc", "\" regular\n")
+
+	ctx := context.Background()
+	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}}
+	result, err := Compile(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(result.Files) == 0 {
+		t.Fatal("expected compiled files")
+	}
+	for _, cf := range result.Files {
+		if cf.SourceSignature == "" {
+			t.Errorf("file %q has an empty SourceSignature", cf.RelPath)
+		}
+	}
+}
+
+func TestCompile_RecordsSignatureInManifest(t *testing.T) {
+	root := t.TempDir()
+	base := makeDir(t, root, "base")
+	writeFile(t, base, "config.subfile-001.fish", "# 001\n")
+	writeFile(t, base, "config.subfile-050.fish", "# 050\n")
+
+	ctx := context.Background()
+	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}}
+	compileDir := t.TempDir()
+
+	result, err := Compile(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if _, err = WriteCompiled(ctx, result, WriteConfig{CompileDir: compileDir}); err != nil {
+		t.Fatalf("WriteCompiled: %v", err)
+	}
+
+	s, err := state.Load(ctx, compileDir)
+	if err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	for _, cf := range result.Files {
+		entry, ok := s.Compiled[cf.RelPath]
+		if !ok {
+			t.Errorf("manifest missing entry for %q", cf.RelPath)
+			continue
+		}
+		if entry.SourceSignature == "" {
+			t.Errorf("manifest entry %q has an empty SourceSignature", cf.RelPath)
+		}
+		if entry.SourceSignature != cf.SourceSignature {
+			t.Errorf("manifest signature for %q = %q, want %q",
+				cf.RelPath, entry.SourceSignature, cf.SourceSignature)
+		}
+	}
+}
+
+func TestCompile_SignatureMovesAcrossRuns(t *testing.T) {
+	root := t.TempDir()
+	base := makeDir(t, root, "base")
+	p := writeFile(t, base, ".subfile-010.bashrc", "export A=1\n")
+
+	ctx := context.Background()
+	cfg := CompileConfig{DotfilesDir: root, Identity: identity.Identity{}}
+
+	first, err := Compile(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Compile #1: %v", err)
+	}
+
+	if err = os.WriteFile(p, []byte("export A=2\n"), 0o644); err != nil {
+		t.Fatalf("rewrite source: %v", err)
+	}
+	second, err := Compile(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Compile #2: %v", err)
+	}
+
+	if first.Files[0].SourceSignature == second.Files[0].SourceSignature {
+		t.Error("signature should move after a source content change")
 	}
 }
 

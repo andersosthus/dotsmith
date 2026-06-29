@@ -24,6 +24,7 @@ func newApplyCmd() *cobra.Command {
 
 			compileCfg := compiler.CompileConfig{
 				DotfilesDir: cfg.DotfilesDir,
+				CompileDir:  cfg.CompileDir,
 				Identity:    cfg.Identity,
 				Identities:  set,
 				DryRun:      cfg.DryRun,
@@ -34,6 +35,9 @@ func newApplyCmd() *cobra.Command {
 			}
 
 			printDryRunReports(cmd.OutOrStdout(), result.DryRunReports)
+			if cfg.DryRun {
+				printDryRunReuse(cmd.OutOrStdout(), result.Files)
+			}
 
 			writeCfg := compiler.WriteConfig{
 				CompileDir: cfg.CompileDir,
@@ -66,9 +70,9 @@ func newApplyCmd() *cobra.Command {
 			// dangling symlink is resolved before control returns. The
 			// dangling-symlink warning is therefore deliberately not printed here.
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"compiled: %d written, %d unchanged, %d pruned; "+
+				"compiled: %d written, %d reused, %d unchanged, %d pruned; "+
 					"linked: %d created, %d updated, %d unchanged, %d removed\n",
-				stats.Written, stats.Unchanged, len(stats.Pruned),
+				stats.Written, stats.Reused, stats.Unchanged, len(stats.Pruned),
 				linkResult.Created, linkResult.Updated, linkResult.Unchanged, linkResult.Removed)
 			warnDisowned(cmd.ErrOrStderr(), linkResult.Disowned)
 			return nil

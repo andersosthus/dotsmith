@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,8 +35,8 @@ func TestSaveLoad_CompiledRoundTrip(t *testing.T) {
 
 	original := New()
 	original.Symlinks[".bashrc"] = SymlinkEntry{Source: ".bashrc", Target: ".bashrc", ContentHash: "h1"}
-	original.Compiled[".bashrc"] = CompiledEntry{ContentHash: "h1"}
-	original.Compiled[".config/nvim/init.vim"] = CompiledEntry{ContentHash: "h2"}
+	original.Compiled[".bashrc"] = CompiledEntry{ContentHash: "h1", SourceSignature: "sig1"}
+	original.Compiled[".config/nvim/init.vim"] = CompiledEntry{ContentHash: "h2", SourceSignature: "sig2"}
 
 	if err := Save(ctx, original, dir); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -52,6 +53,48 @@ func TestSaveLoad_CompiledRoundTrip(t *testing.T) {
 		if !ok || got != v {
 			t.Errorf("Compiled[%q] = %v (ok=%v), want %v", k, got, ok, v)
 		}
+	}
+}
+
+func TestLoad_CompiledEntryAbsentSignature(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, stateFile)
+	// A manifest entry written by an older binary has a content hash but no
+	// source_signature field. Loading it must not crash and must treat the
+	// signature as the empty string.
+	doc := `{"symlinks":{},"compiled":{".bashrc":{"content_hash":"h1"}}}`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s, err := Load(ctx, dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	entry, ok := s.Compiled[".bashrc"]
+	if !ok {
+		t.Fatal("expected a .bashrc compiled entry")
+	}
+	if entry.SourceSignature != "" {
+		t.Errorf("absent signature should load as empty string, got %q", entry.SourceSignature)
+	}
+}
+
+func TestSave_OmitsEmptySignature(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	s := New()
+	s.Compiled[".bashrc"] = CompiledEntry{ContentHash: "h1"}
+	if err := Save(ctx, s, dir); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, stateFile))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(data), "source_signature") {
+		t.Errorf("empty signature should be omitted from JSON, got: %s", data)
 	}
 }
 
