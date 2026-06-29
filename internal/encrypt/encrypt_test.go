@@ -1002,6 +1002,41 @@ func TestResolve_EncryptedRSA_OldPEM_NoSiblingSkipped(t *testing.T) {
 	}
 }
 
+// TestDecrypt_RoundTrip proves the streaming Decrypt path decrypts to the
+// correct plaintext for both age encodings: armored (age -a) and binary (the age
+// CLI default). Parametrizing across encodings makes the binary path — which the
+// stream path previously could not handle because it hardcoded the armor reader —
+// a first-class case rather than an untested dimension.
+func TestDecrypt_RoundTrip(t *testing.T) {
+	encodings := []struct {
+		name    string
+		encrypt func(*testing.T, string, ...age.Recipient) []byte
+	}{
+		{name: "armor", encrypt: encryptToRecipients},
+		{name: "binary", encrypt: encryptBinaryToRecipients},
+	}
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			id := generateAgeIdentity(t)
+			keyPath := writeAgeKeyFile(t, dir, id)
+			set, err := Resolve(context.Background(), KeySource{IdentityFile: keyPath, IdentityFileExplicit: true}, nil)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			ct := enc.encrypt(t, "stream contents", id.Recipient())
+			out, err := Decrypt(context.Background(), bytes.NewReader(ct), set)
+			if err != nil {
+				t.Fatalf("Decrypt: %v", err)
+			}
+			if string(out) != "stream contents" {
+				t.Errorf("got %q, want %q", out, "stream contents")
+			}
+		})
+	}
+}
+
 // ---- Decrypt errors ---------------------------------------------------------
 
 func TestDecrypt_EmptySet(t *testing.T) {
