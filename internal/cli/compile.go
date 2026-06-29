@@ -29,6 +29,7 @@ func newCompileCmd() *cobra.Command {
 
 			compileCfg := compiler.CompileConfig{
 				DotfilesDir: cfg.DotfilesDir,
+				CompileDir:  cfg.CompileDir,
 				Identity:    cfg.Identity,
 				Identities:  set,
 				DryRun:      cfg.DryRun,
@@ -49,8 +50,9 @@ func newCompileCmd() *cobra.Command {
 				return fmt.Errorf("write compiled: %w", err)
 			}
 
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "compiled: %d written, %d unchanged, %d pruned\n",
-				stats.Written, stats.Unchanged, len(stats.Pruned))
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"compiled: %d written, %d reused, %d unchanged, %d pruned\n",
+				stats.Written, stats.Reused, stats.Unchanged, len(stats.Pruned))
 			printDanglingWarning(cmd.ErrOrStderr(), stats.Dangling)
 			return nil
 		},

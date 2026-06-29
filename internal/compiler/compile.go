@@ -21,6 +21,12 @@ import (
 type CompileConfig struct {
 	// DotfilesDir is the root of the dotfiles repository.
 	DotfilesDir string
+	// CompileDir is the directory holding the previous compile's output and
+	// state. Compile loads the prior state from here once and evaluates the reuse
+	// gate (see ADR 0015) so unchanged targets skip decryption. When empty, reuse
+	// is disabled and every target is (re)compiled — used by callers like render
+	// that never write output.
+	CompileDir string
 	// Identity is the resolved identity for override layer selection.
 	Identity identity.Identity
 	// Identities is the resolved candidate identity set for decrypting
@@ -30,6 +36,9 @@ type CompileConfig struct {
 	// identity that would decrypt it instead of decrypting it. No passphrase is
 	// requested and no key is unlocked; the probe outcomes are returned in
 	// CompileResult.DryRunReports. Encrypted file content is left empty.
+	//
+	// Dry-run does not reuse: it probes every encrypted source unconditionally
+	// (ADR 0004), so the reuse gate is not consulted under DryRun.
 	DryRun bool
 }
 
@@ -46,9 +55,14 @@ type CompiledFile struct {
 	// SourceSignature is the ordered digest of the contributing subfiles'
 	// content hashes (ciphertext for .age sources), computed without decrypting.
 	// It is the gate-1 input for reuse (see ADR 0015) and is recorded in the
-	// manifest on every compile. This slice only records it; it does not yet
-	// change compile behavior.
+	// manifest on every compile.
 	SourceSignature string
+	// Reused is true when this target's already-compiled output was reused
+	// (both reuse gates passed, see ADR 0015): no source was decrypted and no
+	// content was reassembled. Content is nil for a reused file; ContentHash and
+	// SourceSignature carry the values recorded by the previous compile so the
+	// linker keeps its symlink and the manifest is rewritten unchanged.
+	Reused bool
 }
 
 // DryRunReport records, for one age-encrypted source file, which identity would
@@ -70,6 +84,12 @@ type CompileResult struct {
 	// DryRunReports holds one entry per age-encrypted source probed during a
 	// dry-run compile, in discovery order. It is empty for a normal compile.
 	DryRunReports []DryRunReport
+
+	// priorState is the state Compile loaded once for the reuse decision (see
+	// ADR 0015). It is threaded to WriteCompiled so the state is loaded once per
+	// run, not twice. It is nil when the result was built directly (e.g. in a
+	// test) rather than by Compile; WriteCompiled then loads the state itself.
+	priorState *state.State
 }
 
 // WriteConfig holds parameters for writing compiled output to disk.
@@ -86,6 +106,11 @@ type WriteStats struct {
 	Written int
 	// Unchanged is the number of files whose content was identical.
 	Unchanged int
+	// Reused is the number of files whose already-compiled output was reused
+	// without decrypting any source (both reuse gates passed, see ADR 0015).
+	// It is distinct from Unchanged, which counts files that were decrypted and
+	// reassembled but produced byte-identical output.
+	Reused int
 	// Pruned holds the relative paths of compiled files removed because their
 	// source no longer exists (present in the previous manifest, absent from the
 	// current result). Under DryRun these are the paths that would be pruned.
@@ -98,15 +123,35 @@ type WriteStats struct {
 }
 
 // Compile discovers and assembles all dotfiles for the given configuration.
+//
+// It loads the prior compile state once (see ADR 0015) and, for a normal (non
+// dry-run) compile, evaluates the two-gate reuse check per target before
+// decrypting anything: a target whose source signature still matches and whose
+// compiled output is still valid on disk is reused as-is, skipping decryption
+// entirely. The loaded state is threaded into the result so WriteCompiled does
+// not load it a second time.
 func Compile(ctx context.Context, cfg CompileConfig) (*CompileResult, error) {
 	discovered, err := Discover(ctx, cfg.DotfilesDir, cfg.Identity)
 	if err != nil {
 		return nil, fmt.Errorf("compile: discover: %w", err)
 	}
 
+	prior, err := loadReuseState(ctx, cfg.CompileDir)
+	if err != nil {
+		return nil, fmt.Errorf("compile: %w", err)
+	}
+
 	result := &CompileResult{}
+	// Thread the loaded state to WriteCompiled only when this compile actually
+	// read it from a compile directory (so the state is loaded once, not twice).
+	// When CompileDir is empty the loaded state is a placeholder, not the on-disk
+	// manifest — leaving priorState nil makes WriteCompiled load the real state
+	// from its own WriteConfig.CompileDir, so pruning still sees prior entries.
+	if cfg.CompileDir != "" {
+		result.priorState = prior
+	}
 	for _, entry := range discovered {
-		cf, reports, compileErr := compileEntry(ctx, entry, cfg)
+		cf, reports, compileErr := compileEntry(ctx, entry, cfg, prior)
 		if compileErr != nil {
 			return nil, fmt.Errorf("compile %s: %w", entry.Target, compileErr)
 		}
@@ -117,14 +162,40 @@ func Compile(ctx context.Context, cfg CompileConfig) (*CompileResult, error) {
 }
 
 // compileEntry assembles the content of a single FileEntry, returning any dry-run
-// probe reports for age-encrypted sources it touched. It also records the
-// target's source signature (gate-1 input for reuse, see ADR 0015) — computed
-// from the raw source bytes without decrypting — on the returned CompiledFile.
-func compileEntry(ctx context.Context, entry *FileEntry, cfg CompileConfig) (*CompiledFile, []DryRunReport, error) {
+// probe reports for age-encrypted sources it touched.
+//
+// It first computes the target's source signature (gate-1 input for reuse, see
+// ADR 0015) from the raw source bytes without decrypting. For a normal compile
+// it then runs the two-gate reuse check against the prior state: if both gates
+// pass the target is reused — no source is decrypted or read for content — and a
+// flagged CompiledFile carrying the prior ContentHash and signature is returned
+// with nil Content. Otherwise (or under dry-run, which never reuses) it falls
+// back to decrypting and assembling as before.
+func compileEntry(
+	ctx context.Context, entry *FileEntry, cfg CompileConfig, prior *state.State,
+) (*CompiledFile, []DryRunReport, error) {
+	sig, err := sourceSignatureFunc(ctx, entry.Subfiles)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !cfg.DryRun && cfg.CompileDir != "" {
+		decision := reuseGate(prior.Compiled, cfg.CompileDir, entry.Target, sig)
+		if decision.Reuse {
+			return &CompiledFile{
+				RelPath:         entry.Target,
+				Content:         nil,
+				ContentHash:     decision.ContentHash,
+				FromEncrypted:   entryFromEncrypted(entry),
+				SourceSignature: sig,
+				Reused:          true,
+			}, nil, nil
+		}
+	}
+
 	var (
 		cf      *CompiledFile
 		reports []DryRunReport
-		err     error
 	)
 	if entry.IsRegular {
 		cf, reports, err = compileRegular(ctx, entry, cfg)
@@ -134,13 +205,21 @@ func compileEntry(ctx context.Context, entry *FileEntry, cfg CompileConfig) (*Co
 	if err != nil {
 		return nil, nil, err
 	}
-
-	sig, err := sourceSignatureFunc(ctx, entry.Subfiles)
-	if err != nil {
-		return nil, nil, err
-	}
 	cf.SourceSignature = sig
 	return cf, reports, nil
+}
+
+// entryFromEncrypted reports whether any subfile of entry is age-encrypted,
+// without reading or decrypting it. A reused target carries this so its compiled
+// file's mode (0600 vs 0644) is re-asserted correctly even though no content is
+// produced (see ADR 0009).
+func entryFromEncrypted(entry *FileEntry) bool {
+	for i := range entry.Subfiles {
+		if entry.Subfiles[i].Encrypted {
+			return true
+		}
+	}
+	return false
 }
 
 // sourceSignatureFunc is the source-signature sink, injectable so tests can
@@ -282,9 +361,16 @@ func validateNoDuplicates(entry *FileEntry) error {
 // Under DryRun nothing is written, no file is pruned, and no state is saved, but
 // the prune and dangling sets are still computed and reported.
 func WriteCompiled(ctx context.Context, result *CompileResult, cfg WriteConfig) (WriteStats, error) {
-	s, err := state.Load(ctx, cfg.CompileDir)
-	if err != nil {
-		return WriteStats{}, fmt.Errorf("write compiled: load state: %w", err)
+	// Reuse the state Compile already loaded for the reuse decision (threaded on
+	// the result), loading it here only when a caller built the result directly
+	// (e.g. a test) — so a normal run loads the state exactly once.
+	s := result.priorState
+	if s == nil {
+		loaded, err := state.Load(ctx, cfg.CompileDir)
+		if err != nil {
+			return WriteStats{}, fmt.Errorf("write compiled: load state: %w", err)
+		}
+		s = loaded
 	}
 
 	current := currentManifest(result)
@@ -296,33 +382,48 @@ func WriteCompiled(ctx context.Context, result *CompileResult, cfg WriteConfig) 
 		return stats, nil
 	}
 
-	if err = ensureCompileDir(cfg.CompileDir); err != nil {
+	if err := ensureCompileDir(cfg.CompileDir); err != nil {
 		return WriteStats{}, err
 	}
 
-	if err = prune(cfg.CompileDir, pruned); err != nil {
+	if err := prune(cfg.CompileDir, pruned); err != nil {
 		return WriteStats{}, err
 	}
 
-	for _, cf := range result.Files {
-		changed, writeErr := writeCompiledFile(ctx, cf, cfg)
-		if writeErr != nil {
-			return WriteStats{}, writeErr
-		}
-		if changed {
-			stats.Written++
-		} else {
-			stats.Unchanged++
-		}
+	if err := writeAllFiles(ctx, result.Files, cfg, &stats); err != nil {
+		return WriteStats{}, err
 	}
 
 	// Save the manifest only after every file is on disk, so it never claims a
 	// file that was not written.
 	s.Compiled = current
-	if err = stateSaveFunc(ctx, s, cfg.CompileDir); err != nil {
+	if err := stateSaveFunc(ctx, s, cfg.CompileDir); err != nil {
 		return WriteStats{}, fmt.Errorf("write compiled: save state: %w", err)
 	}
 	return stats, nil
+}
+
+// writeAllFiles writes each compiled file and tallies the per-file outcome into
+// stats: Reused (output served as-is, decryption skipped), Written (new or
+// changed content), or Unchanged (decrypted/reassembled but byte-identical).
+func writeAllFiles(ctx context.Context, files []CompiledFile, cfg WriteConfig, stats *WriteStats) error {
+	for _, cf := range files {
+		changed, err := writeCompiledFile(ctx, cf, cfg)
+		if err != nil {
+			return err
+		}
+		switch {
+		case cf.Reused:
+			// Reused targets are counted apart from decrypted-but-identical
+			// (Unchanged) ones so the avoided-decryption win is visible.
+			stats.Reused++
+		case changed:
+			stats.Written++
+		default:
+			stats.Unchanged++
+		}
+	}
+	return nil
 }
 
 // stateSaveFunc is the manifest-saving sink, injectable so tests can exercise
@@ -401,7 +502,8 @@ func prune(compileDir string, pruned []string) error {
 }
 
 // writeCompiledFile writes a single compiled file. Returns true if the file was
-// written (new or changed content), false if content was already up to date.
+// written (new or changed content), false if content was already up to date or
+// the file was reused.
 //
 // It is only called on the non-dry-run path: WriteCompiled returns before
 // writing anything under DryRun.
@@ -415,6 +517,14 @@ func writeCompiledFile(_ context.Context, cf CompiledFile, cfg WriteConfig) (boo
 
 	perm := compiledFileMode(cf)
 
+	// A reused file's content is left exactly as it is on disk (gate 2 already
+	// confirmed it is the artifact we wrote). Per ADR 0009 the mode is still
+	// re-asserted — 0600 for an encrypted-derived file, else 0644 — without any
+	// content rewrite, so the permission guarantee holds even on the reuse path.
+	if cf.Reused {
+		return false, chmodCompiled(destPath, perm)
+	}
+
 	// Check existing content to avoid unnecessary writes.
 	existing, readErr := os.ReadFile(destPath)
 	if readErr == nil && hashContent(existing) == cf.ContentHash {
@@ -422,9 +532,7 @@ func writeCompiledFile(_ context.Context, cf CompiledFile, cfg WriteConfig) (boo
 		// looser mode (os.WriteFile only applies perm on creation). Repair the
 		// mode for encrypted-derived files so the 0600 guarantee always holds.
 		if cf.FromEncrypted {
-			if err := os.Chmod(destPath, perm); err != nil {
-				return false, fmt.Errorf("chmod %s: %w", destPath, err)
-			}
+			return false, chmodCompiled(destPath, perm)
 		}
 		return false, nil // unchanged
 	}
@@ -434,10 +542,16 @@ func writeCompiledFile(_ context.Context, cf CompiledFile, cfg WriteConfig) (boo
 	}
 	// os.WriteFile leaves the mode untouched when the file already exists, so
 	// chmod explicitly to enforce the intended mode on the changed path too.
-	if err := os.Chmod(destPath, perm); err != nil {
-		return false, fmt.Errorf("chmod %s: %w", destPath, err)
+	return true, chmodCompiled(destPath, perm)
+}
+
+// chmodCompiled enforces a compiled file's intended mode, wrapping any error
+// with the path for context.
+func chmodCompiled(path string, perm os.FileMode) error {
+	if err := os.Chmod(path, perm); err != nil {
+		return fmt.Errorf("chmod %s: %w", path, err)
 	}
-	return true, nil
+	return nil
 }
 
 // compiledFileMode returns the file mode a compiled file should carry: 0600 for
