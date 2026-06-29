@@ -54,3 +54,34 @@ jobs:
       - uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee  # v9.2.1
         with:
           version: latest
+
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Reject any dependency under a copyleft/incompatible license before it
+      # can ship in the binary.
+      - name: Check dependency licenses
+        run: |
+          go install github.com/google/go-licenses@latest
+          "$(go env GOPATH)/bin/go-licenses" check ./cmd/dotsmith \
+            --disallowed_types=forbidden,restricted
+
+      # Ensure the committed THIRD_PARTY_LICENSES matches the current deps.
+      # Regenerate and fail if it drifted — run ./scripts/licenses.sh and commit.
+      - name: Verify THIRD_PARTY_LICENSES is current
+        run: |
+          ./scripts/licenses.sh
+          if ! git diff --exit-code THIRD_PARTY_LICENSES; then
+            echo "::error::THIRD_PARTY_LICENSES is stale — run ./scripts/licenses.sh and commit the result."
+            exit 1
+          fi
