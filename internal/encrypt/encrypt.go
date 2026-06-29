@@ -37,9 +37,9 @@ func isArmored(leading []byte) bool {
 // hand straight to age.Decrypt: an armor reader when the input is armored, and
 // the buffered reader itself (unwrapped) for binary input. It is the shared
 // encoding-detection seam, intended as the single place the armored/binary
-// decision is made so call sites cannot drift. The streaming Decrypt and
-// DecryptFile paths route through it; the dry-run stanza-probe path adopts it in
-// follow-up work.
+// decision is made so call sites cannot drift. All three decrypt paths — the
+// streaming Decrypt, DecryptFile, and the dry-run stanza-capture probe — route
+// through it.
 //
 // Peeking — rather than trying one decoder and rewinding on failure — keeps the
 // streaming io.Reader contract intact and is deterministic. A short Peek (fewer

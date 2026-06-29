@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"filippo.io/age"
@@ -100,23 +101,43 @@ func TestDryRunProbeFile_RSAMatch(t *testing.T) {
 	}
 }
 
+// TestDryRunProbeFile_NativeAgeMatch proves the dry-run stanza-capture probe
+// reports the matching identity for both age encodings: armored (age -a) and
+// binary (the age CLI default). Parametrizing across encodings makes the binary
+// path — which the probe previously could not handle because captureStanzas
+// hardcoded the armor reader — a first-class case rather than an untested
+// dimension.
 func TestDryRunProbeFile_NativeAgeMatch(t *testing.T) {
-	dir := t.TempDir()
-	id := generateAgeIdentity(t)
-	keyPath := writeAgeKeyFile(t, dir, id)
-	set, err := Resolve(context.Background(),
-		KeySource{IdentityFile: keyPath, IdentityFileExplicit: true}, nil)
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
+	encodings := []struct {
+		name    string
+		encrypt func(*testing.T, string, ...age.Recipient) []byte
+	}{
+		{name: "armor", encrypt: encryptToRecipients},
+		{name: "binary", encrypt: encryptBinaryToRecipients},
 	}
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			id := generateAgeIdentity(t)
+			keyPath := writeAgeKeyFile(t, dir, id)
+			set, err := Resolve(context.Background(),
+				KeySource{IdentityFile: keyPath, IdentityFileExplicit: true}, nil)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
 
-	encPath := writeEncFile(t, t.TempDir(), "secret.age", "x", id.Recipient())
-	res, err := set.DryRunProbeFile(context.Background(), encPath)
-	if err != nil {
-		t.Fatalf("DryRunProbeFile: %v", err)
-	}
-	if !res.Matched || res.Path != keyPath || res.Kind != string(typeNativeAge) {
-		t.Errorf("got %+v, want match on %s [age]", res, keyPath)
+			encPath := filepath.Join(t.TempDir(), "secret.age")
+			if werr := os.WriteFile(encPath, enc.encrypt(t, "x", id.Recipient()), 0o600); werr != nil {
+				t.Fatalf("WriteFile: %v", werr)
+			}
+			res, err := set.DryRunProbeFile(context.Background(), encPath)
+			if err != nil {
+				t.Fatalf("DryRunProbeFile: %v", err)
+			}
+			if !res.Matched || res.Path != keyPath || res.Kind != string(typeNativeAge) {
+				t.Errorf("got %+v, want match on %s [age]", res, keyPath)
+			}
+		})
 	}
 }
 
@@ -236,6 +257,11 @@ func TestDryRunProbeFile_MissingFile(t *testing.T) {
 	}
 }
 
+// TestDryRunProbeFile_CorruptFile feeds the probe garbage that matches neither
+// the armor marker nor a valid age header. It must surface an error, and that
+// error must be age's own accurate binary-header error rather than the
+// misleading "invalid armor" message — guarding the positive-detect-armor,
+// default-to-binary decision in the shared reader helper.
 func TestDryRunProbeFile_CorruptFile(t *testing.T) {
 	dir := t.TempDir()
 	bad := filepath.Join(dir, "corrupt.age")
@@ -246,8 +272,15 @@ func TestDryRunProbeFile_CorruptFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if _, derr := set.DryRunProbeFile(context.Background(), bad); derr == nil {
+	_, derr := set.DryRunProbeFile(context.Background(), bad)
+	if derr == nil {
 		t.Fatal("expected error for corrupt age file, got nil")
+	}
+	// A file matching neither marker takes the binary path, so age surfaces its
+	// own accurate binary-header error rather than the misleading "invalid armor"
+	// message that defaulting to the armor reader would produce.
+	if strings.Contains(derr.Error(), "invalid armor") {
+		t.Errorf("error misleadingly blames armor for a non-armored file: %v", derr)
 	}
 }
 
