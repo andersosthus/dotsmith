@@ -144,6 +144,29 @@ func warnDisowned(w io.Writer, disowned []string) {
 	}
 }
 
+// reportBlockers renders the blockers a dry-run collected and returns a sentinel
+// error driving a non-zero exit when any exist. It is the shared reporter used by
+// both link and apply (sibling to warnDisowned): the caller has already printed
+// the normal summary to stdout, and this writes the blocker overview to w
+// (stderr). cmd names the originating command for the sentinel message.
+//
+// It is a no-op returning nil when there are no blockers, so a clean dry-run
+// exits zero with no blocker section.
+func reportBlockers(w io.Writer, cmd string, blockers []linker.Blocker) error {
+	if len(blockers) == 0 {
+		return nil
+	}
+	_, _ = fmt.Fprintf(w, "%d blocker(s) would prevent linking:\n", len(blockers))
+	for _, b := range blockers {
+		// RelPath is a repo-controlled target path; render with %q so any
+		// terminal control sequences in it cannot manipulate or spoof the
+		// terminal (same reasoning as printDryRunReports). Detail is composed
+		// from absolute filesystem paths and is emitted verbatim.
+		_, _ = fmt.Fprintf(w, "  %q: %s\n", b.RelPath, b.Detail)
+	}
+	return fmt.Errorf("%s: %d blocker(s) would prevent linking", cmd, len(blockers))
+}
+
 // compiledFileRefs walks compileDir and returns a FileRef for every compiled
 // file (skipping the state file and any hidden metadata).
 func compiledFileRefs(compileDir string) ([]linker.FileRef, error) {

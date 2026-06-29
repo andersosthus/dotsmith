@@ -8,7 +8,52 @@ import (
 	"testing"
 
 	"github.com/andersosthus/dotsmith/internal/compiler"
+	"github.com/andersosthus/dotsmith/internal/linker"
 )
+
+func TestReportBlockers_Empty(t *testing.T) {
+	var buf bytes.Buffer
+	if err := reportBlockers(&buf, "link", nil); err != nil {
+		t.Errorf("empty blockers should return nil error, got %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected no output for no blockers, got %q", buf.String())
+	}
+}
+
+func TestReportBlockers_HeaderAndSentinel(t *testing.T) {
+	var buf bytes.Buffer
+	err := reportBlockers(&buf, "link", []linker.Blocker{
+		{RelPath: ".bashrc", Kind: linker.BlockerConflict, Detail: "conflict: /h/.bashrc exists and is not a symlink"},
+	})
+	if err == nil {
+		t.Fatal("expected a sentinel error when blockers exist")
+	}
+	if err.Error() != "link: 1 blocker(s) would prevent linking" {
+		t.Errorf("sentinel = %q", err.Error())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "1 blocker(s) would prevent linking:") {
+		t.Errorf("output missing header: %q", out)
+	}
+	if !strings.Contains(out, "exists and is not a symlink") {
+		t.Errorf("output missing detail: %q", out)
+	}
+}
+
+// TestReportBlockers_SanitizesRelPath verifies the repo-controlled RelPath is
+// rendered with %q so terminal control sequences cannot spoof the terminal.
+func TestReportBlockers_SanitizesRelPath(t *testing.T) {
+	const evil = "a\x1b[2K\rEvil\n.bashrc"
+	var buf bytes.Buffer
+	_ = reportBlockers(&buf, "link", []linker.Blocker{
+		{RelPath: evil, Kind: linker.BlockerConflict, Detail: "conflict: occupied"},
+	})
+	out := buf.String()
+	if strings.ContainsAny(out, "\x1b\r") {
+		t.Errorf("output leaks raw control characters: %q", out)
+	}
+}
 
 // isolateHome points HOME and XDG at empty temp dirs so SSH discovery (on by
 // default) finds nothing and the test relies solely on the configured age

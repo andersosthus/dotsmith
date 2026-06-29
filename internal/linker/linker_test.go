@@ -3,6 +3,7 @@ package linker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1554,8 +1555,10 @@ func TestLink_RefusesSymlinkedParent_Nested(t *testing.T) {
 	}
 }
 
-// TestLink_RefusesSymlinkedParent_DryRun verifies the guard fires even in dry
-// run, so a dry run faithfully reports the conflict it would hit.
+// TestLink_RefusesSymlinkedParent_DryRun verifies the guard still detects a
+// symlinked parent in dry run, but now collects it as a conflict blocker (with a
+// nil error) rather than aborting — so a dry run faithfully reports the conflict
+// it would hit alongside any others.
 func TestLink_RefusesSymlinkedParent_DryRun(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "home")
@@ -1567,11 +1570,15 @@ func TestLink_RefusesSymlinkedParent_DryRun(t *testing.T) {
 	}
 	hash := writeCompiled(t, compile, ".config/app.conf", "managed\n")
 
-	_, err := Link(context.Background(),
+	result, err := Link(context.Background(),
 		LinkConfig{CompileDir: compile, TargetDir: target, DryRun: true},
 		[]FileRef{{RelPath: ".config/app.conf", ContentHash: hash}})
-	if err == nil {
-		t.Fatal("expected conflict error for symlinked parent in dry run, got nil")
+	if err != nil {
+		t.Fatalf("dry-run Link returned error, want nil: %v", err)
+	}
+	b := blockerByRel(t, result.Blockers, ".config/app.conf")
+	if b.Kind != BlockerConflict {
+		t.Errorf("Kind = %q, want %q", b.Kind, BlockerConflict)
 	}
 }
 
@@ -1680,3 +1687,277 @@ func TestStateJSON_RoundTrip(t *testing.T) {
 	}
 }
 
+
+// ---- dry-run blocker collection tests ---------------------------------------
+
+// blockerByRel returns the blocker for relPath, or fails the test if absent.
+func blockerByRel(t *testing.T, blockers []Blocker, relPath string) Blocker {
+	t.Helper()
+	for _, b := range blockers {
+		if b.RelPath == relPath {
+			return b
+		}
+	}
+	t.Fatalf("no blocker for %q in %+v", relPath, blockers)
+	return Blocker{}
+}
+
+// setupThreeConflicts populates compileDir with three compiled files and
+// targetDir with the three conflict sub-cases (occupied target, wrong-pointing
+// symlink, symlinked parent directory). It returns the FileRefs to link.
+func setupThreeConflicts(t *testing.T, compileDir, targetDir string) []FileRef {
+	t.Helper()
+	// Occupied target: a real (non-symlink) file at .bashrc.
+	hBash := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	if err := os.WriteFile(filepath.Join(targetDir, ".bashrc"), []byte("mine"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// Wrong-pointing symlink at .vimrc.
+	hVim := writeCompiled(t, compileDir, ".vimrc", "set nocompatible\n")
+	if err := os.Symlink("/dev/null", filepath.Join(targetDir, ".vimrc")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	// Symlinked parent directory: .config -> elsewhere, target .config/git/config.
+	hGit := writeCompiled(t, compileDir, ".config/git/config", "[core]\n")
+	if err := os.Symlink(t.TempDir(), filepath.Join(targetDir, ".config")); err != nil {
+		t.Fatalf("Symlink parent: %v", err)
+	}
+	return []FileRef{
+		{RelPath: ".bashrc", ContentHash: hBash},
+		{RelPath: ".vimrc", ContentHash: hVim},
+		{RelPath: ".config/git/config", ContentHash: hGit},
+	}
+}
+
+// TestLink_DryRun_CollectsAllConflictSubCases verifies that a dry-run continues
+// past every conflict and collects all three conflict sub-cases in one call with
+// Kind == conflict, returning a nil error.
+func TestLink_DryRun_CollectsAllConflictSubCases(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	files := setupThreeConflicts(t, compileDir, targetDir)
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true}, files)
+	if err != nil {
+		t.Fatalf("dry-run Link returned error: %v", err)
+	}
+	if len(result.Blockers) != 3 {
+		t.Fatalf("got %d blockers, want 3: %+v", len(result.Blockers), result.Blockers)
+	}
+	for _, rel := range []string{".bashrc", ".vimrc", ".config/git/config"} {
+		assertConflictBlocker(t, result.Blockers, rel)
+	}
+
+	// Blocked files are excluded from the change counts.
+	if result.Created != 0 || result.Updated != 0 || result.Unchanged != 0 {
+		t.Errorf("blocked files leaked into counts: created=%d updated=%d unchanged=%d",
+			result.Created, result.Updated, result.Unchanged)
+	}
+
+	// Nothing was written.
+	if _, statErr := os.Lstat(filepath.Join(targetDir, ".config", "git")); !os.IsNotExist(statErr) {
+		t.Error("dry-run created files under the symlinked parent")
+	}
+}
+
+// assertConflictBlocker fails the test unless relPath has a conflict blocker with
+// a non-empty Detail.
+func assertConflictBlocker(t *testing.T, blockers []Blocker, relPath string) {
+	t.Helper()
+	b := blockerByRel(t, blockers, relPath)
+	if b.Kind != BlockerConflict {
+		t.Errorf("%s: Kind = %q, want %q", relPath, b.Kind, BlockerConflict)
+	}
+	if b.Detail == "" {
+		t.Errorf("%s: Detail is empty", relPath)
+	}
+}
+
+// TestLink_DryRun_BlockersSorted verifies blockers are sorted by RelPath
+// regardless of the input order.
+func TestLink_DryRun_BlockersSorted(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	rels := []string{"z", "a", "m"}
+	files := make([]FileRef, 0, len(rels))
+	for _, rel := range rels {
+		h := writeCompiled(t, compileDir, rel, rel+"\n")
+		if err := os.WriteFile(filepath.Join(targetDir, rel), []byte("mine"), 0o644); err != nil {
+			t.Fatalf("WriteFile %s: %v", rel, err)
+		}
+		files = append(files, FileRef{RelPath: rel, ContentHash: h})
+	}
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true}, files)
+	if err != nil {
+		t.Fatalf("dry-run Link: %v", err)
+	}
+	got := make([]string, len(result.Blockers))
+	for i, b := range result.Blockers {
+		got[i] = b.RelPath
+	}
+	want := []string{"a", "m", "z"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("blocker order = %v, want %v", got, want)
+	}
+}
+
+// TestLink_DryRun_NonBlockedFilesStillCounted verifies that a dry-run with a mix
+// of blocked and clean files counts only the non-blocked files.
+func TestLink_DryRun_NonBlockedFilesStillCounted(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	hOK := writeCompiled(t, compileDir, ".okrc", "ok\n")
+	hBad := writeCompiled(t, compileDir, ".badrc", "bad\n")
+	if err := os.WriteFile(filepath.Join(targetDir, ".badrc"), []byte("mine"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true},
+		[]FileRef{
+			{RelPath: ".okrc", ContentHash: hOK},
+			{RelPath: ".badrc", ContentHash: hBad},
+		})
+	if err != nil {
+		t.Fatalf("dry-run Link: %v", err)
+	}
+	if result.Created != 1 {
+		t.Errorf("Created = %d, want 1 (the non-blocked file)", result.Created)
+	}
+	if len(result.Blockers) != 1 {
+		t.Errorf("Blockers = %d, want 1", len(result.Blockers))
+	}
+}
+
+// TestLink_DryRun_NoBlockers verifies a clean dry-run returns an empty Blockers
+// slice and a nil error.
+func TestLink_DryRun_NoBlockers(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	h := writeCompiled(t, compileDir, ".bashrc", "data\n")
+
+	result, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir, DryRun: true},
+		[]FileRef{{RelPath: ".bashrc", ContentHash: h}})
+	if err != nil {
+		t.Fatalf("dry-run Link: %v", err)
+	}
+	if len(result.Blockers) != 0 {
+		t.Errorf("Blockers = %d, want 0", len(result.Blockers))
+	}
+}
+
+// TestLink_RealRun_FailsFast_ByteIdenticalMessages verifies a real (non-dry-run)
+// run still returns on the first conflict with today's exact error message for
+// each sub-case, and that Blockers stays empty.
+func TestLink_RealRun_FailsFast_ByteIdenticalMessages(t *testing.T) {
+	tests := []struct {
+		name    string
+		relPath string
+		setup   func(t *testing.T, targetDir string)
+		wantErr func(targetDir string) string
+	}{
+		{
+			name:    "occupied target",
+			relPath: ".bashrc",
+			setup: func(t *testing.T, targetDir string) {
+				if err := os.WriteFile(filepath.Join(targetDir, ".bashrc"), []byte("mine"), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			},
+			wantErr: func(targetDir string) string {
+				return fmt.Sprintf("link .bashrc: conflict: %s exists and is not a symlink",
+					filepath.Join(targetDir, ".bashrc"))
+			},
+		},
+		{
+			name:    "wrong symlink",
+			relPath: ".vimrc",
+			setup: func(t *testing.T, targetDir string) {
+				if err := os.Symlink("/dev/null", filepath.Join(targetDir, ".vimrc")); err != nil {
+					t.Fatalf("Symlink: %v", err)
+				}
+			},
+			wantErr: func(targetDir string) string {
+				return fmt.Sprintf("link .vimrc: conflict: %s points to /dev/null, expected %s",
+					filepath.Join(targetDir, ".vimrc"), "EXPECT_SOURCE")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			compileDir, targetDir := t.TempDir(), t.TempDir()
+			h := writeCompiled(t, compileDir, tc.relPath, "data\n")
+			tc.setup(t, targetDir)
+
+			result, err := Link(context.Background(),
+				LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+				[]FileRef{{RelPath: tc.relPath, ContentHash: h}})
+			if err == nil {
+				t.Fatal("expected real-run conflict error, got nil")
+			}
+			want := strings.ReplaceAll(tc.wantErr(targetDir), "EXPECT_SOURCE",
+				filepath.Join(compileDir, tc.relPath))
+			if err.Error() != want {
+				t.Errorf("error message:\n got: %q\nwant: %q", err.Error(), want)
+			}
+			if result != nil {
+				t.Errorf("real-run result should be nil on error, got %+v", result)
+			}
+		})
+	}
+}
+
+// TestLink_RealRun_FailsFast_SymlinkedParent verifies the symlinked-parent
+// conflict in a real run returns today's exact message.
+func TestLink_RealRun_FailsFast_SymlinkedParent(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	h := writeCompiled(t, compileDir, ".config/git/config", "[core]\n")
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, filepath.Join(targetDir, ".config")); err != nil {
+		t.Fatalf("Symlink parent: %v", err)
+	}
+
+	_, err := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{{RelPath: ".config/git/config", ContentHash: h}})
+	if err == nil {
+		t.Fatal("expected symlinked-parent conflict error, got nil")
+	}
+	want := fmt.Sprintf(
+		"link .config/git/config: conflict: parent %s is a symlink — "+
+			"refusing to plant a managed link inside it; "+
+			"replace the symlink with a real directory or move the target out from under it",
+		filepath.Join(targetDir, ".config"))
+	if err.Error() != want {
+		t.Errorf("error message:\n got: %q\nwant: %q", err.Error(), want)
+	}
+}
+
+// TestLink_RealRun_ConflictBlockersEmpty verifies a real-run conflict leaves
+// no Blockers (it aborts before collecting).
+func TestLink_RealRun_ConflictBlockersEmpty(t *testing.T) {
+	compileDir, targetDir := t.TempDir(), t.TempDir()
+	h := writeCompiled(t, compileDir, ".bashrc", "data\n")
+	if err := os.WriteFile(filepath.Join(targetDir, ".bashrc"), []byte("mine"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	result, _ := Link(context.Background(),
+		LinkConfig{CompileDir: compileDir, TargetDir: targetDir},
+		[]FileRef{{RelPath: ".bashrc", ContentHash: h}})
+	if result != nil && len(result.Blockers) != 0 {
+		t.Errorf("real-run Blockers = %+v, want empty", result.Blockers)
+	}
+}
+
+// TestBlockerError_Unwrap verifies blockerError preserves a wrapped OS error so
+// errors.Is checks still hold.
+func TestBlockerError_Unwrap(t *testing.T) {
+	wrapped := os.ErrPermission
+	be := &blockerError{kind: BlockerConflict, msg: "boom", err: wrapped}
+	if be.Error() != "boom" {
+		t.Errorf("Error() = %q, want %q", be.Error(), "boom")
+	}
+	if !errors.Is(be, wrapped) {
+		t.Error("errors.Is should find the wrapped error")
+	}
+}

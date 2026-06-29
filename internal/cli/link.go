@@ -38,7 +38,7 @@ func newLinkCmd() *cobra.Command {
 				"linked: %d created, %d updated, %d unchanged, %d removed\n",
 				result.Created, result.Updated, result.Unchanged, result.Removed)
 			warnDisowned(cmd.ErrOrStderr(), result.Disowned)
-			return nil
+			return reportBlockers(cmd.ErrOrStderr(), "link", result.Blockers)
 		},
 	}
 }

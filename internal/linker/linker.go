@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/andersosthus/dotsmith/internal/hash"
 	"github.com/andersosthus/dotsmith/internal/safepath"
@@ -47,7 +48,51 @@ type LinkResult struct {
 	// left untouched while dotsmith forgets the path: its compiled artifact is
 	// removed and its state entry dropped. The CLI warns about these paths.
 	Disowned []string
+	// Blockers lists the per-file reasons a dry-run would have prevented linking,
+	// collected instead of aborting on the first one. It is always empty for a
+	// real (non-dry-run) run, which still fails fast on the first conflict.
+	// Blockers are sorted by RelPath for deterministic output.
+	Blockers []Blocker
 }
+
+// BlockerKind classifies why a single file could not be linked.
+type BlockerKind string
+
+const (
+	// BlockerConflict means the target is occupied by something that is not our
+	// managed symlink: a real file, a symlink pointing elsewhere, or a symlinked
+	// parent directory. This mirrors the StatusConflict classification.
+	BlockerConflict BlockerKind = "conflict"
+)
+
+// Blocker is a single reason one file could not be linked during a dry-run.
+type Blocker struct {
+	// RelPath is the relative path of the file that could not be linked.
+	RelPath string
+	// Kind classifies the blocker (currently only conflict).
+	Kind BlockerKind
+	// Detail is the human-readable leaf message describing the problem. It is
+	// byte-identical to the message a real run would surface for the same file.
+	Detail string
+}
+
+// blockerError is the typed error returned by the conflict leaf paths. It is the
+// single classification site: its Error() reproduces today's exact leaf message
+// so a real run is byte-identical, while Unwrap() preserves any wrapped OS error
+// so errors.Is checks still hold. In dry-run, linkFile extracts it via errors.As
+// to build a Blocker and continue; otherwise the error propagates and the real
+// run aborts as before.
+type blockerError struct {
+	kind BlockerKind
+	msg  string
+	err  error
+}
+
+// Error returns the leaf message verbatim.
+func (e *blockerError) Error() string { return e.msg }
+
+// Unwrap returns the wrapped OS error, if any.
+func (e *blockerError) Unwrap() error { return e.err }
 
 // CleanResult reports what happened during a Clean call.
 type CleanResult struct {
@@ -127,6 +172,12 @@ func Link(ctx context.Context, cfg LinkConfig, files []FileRef) (*LinkResult, er
 			return nil, fmt.Errorf("link: save state: %w", err)
 		}
 	}
+
+	// Sort blockers by relative path so dry-run output and tests are
+	// deterministic regardless of the order files were processed.
+	sort.Slice(result.Blockers, func(i, j int) bool {
+		return result.Blockers[i].RelPath < result.Blockers[j].RelPath
+	})
 	return result, nil
 }
 
@@ -255,11 +306,25 @@ func classifyTarget(targetPath, expectedSource string) (targetKind, error) {
 }
 
 // linkFile processes a single FileRef within a Link call.
+//
+// In dry-run mode a per-file blockerError is collected as a Blocker and the run
+// continues, so a dry-run surfaces every blocker in one pass. In a real run any
+// error (blocker or not) is returned and the call aborts on the first one,
+// preserving today's fail-fast behaviour and byte-identical messages.
 func linkFile(cfg LinkConfig, f FileRef, s *state.State, r *LinkResult) error {
 	sourcePath := filepath.Join(cfg.CompileDir, f.RelPath)
 	targetPath := filepath.Join(cfg.TargetDir, f.RelPath)
 	changed, err := linkOne(cfg, f, sourcePath, targetPath, s)
 	if err != nil {
+		var be *blockerError
+		if cfg.DryRun && errors.As(err, &be) {
+			r.Blockers = append(r.Blockers, Blocker{
+				RelPath: f.RelPath,
+				Kind:    be.kind,
+				Detail:  be.Error(),
+			})
+			return nil
+		}
 		return fmt.Errorf("link %s: %w", f.RelPath, err)
 	}
 	switch changed {
@@ -329,11 +394,14 @@ func guardSymlinkedParents(targetDir, targetPath string) error {
 			return fmt.Errorf("stat parent %s: %w", dir, err)
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf(
-				"conflict: parent %s is a symlink — refusing to plant a managed link inside it; "+
-					"replace the symlink with a real directory or move the target out from under it",
-				dir,
-			)
+			return &blockerError{
+				kind: BlockerConflict,
+				msg: fmt.Sprintf(
+					"conflict: parent %s is a symlink — refusing to plant a managed link inside it; "+
+						"replace the symlink with a real directory or move the target out from under it",
+					dir,
+				),
+			}
 		}
 		dir = filepath.Dir(dir)
 	}
@@ -349,16 +417,20 @@ func linkExisting(
 	fi os.FileInfo,
 ) (linkChange, error) {
 	if fi.Mode()&os.ModeSymlink == 0 {
-		return linkUnchanged, fmt.Errorf("conflict: %s exists and is not a symlink", targetPath)
+		return linkUnchanged, &blockerError{
+			kind: BlockerConflict,
+			msg:  fmt.Sprintf("conflict: %s exists and is not a symlink", targetPath),
+		}
 	}
 	existing, err := osReadlinkFunc(targetPath)
 	if err != nil {
 		return linkUnchanged, fmt.Errorf("readlink %s: %w", targetPath, err)
 	}
 	if existing != sourcePath {
-		return linkUnchanged, fmt.Errorf(
-			"conflict: %s points to %s, expected %s", targetPath, existing, sourcePath,
-		)
+		return linkUnchanged, &blockerError{
+			kind: BlockerConflict,
+			msg:  fmt.Sprintf("conflict: %s points to %s, expected %s", targetPath, existing, sourcePath),
+		}
 	}
 
 	// Symlink is correct. Return early if hash still matches.
